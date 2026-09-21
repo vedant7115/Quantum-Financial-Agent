@@ -24,7 +24,7 @@ This guide covers step-by-step instructions to deploy both the **FastAPI Backend
    - **Name**: `quantum-agent-api`
    - **Root Directory**: `backend`
    - **Runtime**: `Python`
-   - **Build Command**: `pip install -r requirements.txt`
+   - **Build Command**: `python -m pip install --upgrade pip && python -m pip install -r requirements.txt`
    - **Start Command**: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
 4. Add **Environment Variables**:
    - `PYTHON_VERSION` = `3.11.0`

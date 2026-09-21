@@ -1,5 +1,4 @@
 # main.py (Root Level)
-# Ensures that whether Root Directory is set to / or /backend, the FastAPI app loads cleanly.
 import os
 import sys
 
@@ -7,7 +6,8 @@ backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "backend")
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-from main import app
+import backend.main as backend_module
+app = backend_module.app
 
 if __name__ == "__main__":
     import uvicorn
