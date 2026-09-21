@@ -25,7 +25,7 @@ This guide covers step-by-step instructions to deploy both the **FastAPI Backend
    - **Root Directory**: `backend`
    - **Runtime**: `Python`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+   - **Start Command**: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
 4. Add **Environment Variables**:
    - `PYTHON_VERSION` = `3.11.0`
    - `GROQ_API_KEY` = `your_groq_api_key` *(from [console.groq.com](https://console.groq.com))*
