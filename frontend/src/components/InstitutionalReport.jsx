@@ -20,6 +20,21 @@ const calculateStrokeOffset = (score, r) => {
   return circ - (score / 100) * circ;
 };
 
+const renderFormattedText = (text) => {
+  if (!text || typeof text !== "string") return text;
+  const parts = text.split(/(\*\*.*?\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={index} className="text-white font-semibold">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    return part;
+  });
+};
+
 export default function InstitutionalReport({ analysisData, stockInfo, isFallbackActive }) {
   const [activeTimeframe, setActiveTimeframe] = useState("1d");
   const [telemetryCollapsed, setTelemetryCollapsed] = useState(true);
@@ -299,8 +314,8 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
                 <BookOpen size={14} className="text-[#FFBA9D]" />
                 <span>Executive Thesis Summary</span>
               </div>
-              <p className="text-slate-200 text-sm leading-relaxed font-light bg-slate-950/40 p-4 border border-white/5 rounded-lg">
-                {finalDecision.summary || "Institutional multi-agent investment intelligence report. Technical, fundamental, and headline sentiment data sets compiled dynamically."}
+              <p className="text-slate-200 text-sm leading-relaxed font-light bg-slate-950/40 p-4 border border-white/5 rounded-lg whitespace-pre-line">
+                {renderFormattedText(finalDecision.summary) || "Institutional multi-agent investment intelligence report. Technical, fundamental, and headline sentiment data sets compiled dynamically."}
               </p>
             </div>
 
@@ -395,7 +410,7 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
             <span>TIMING TRIGGER: WHY ATTENTION IS REQUIRED TODAY</span>
           </div>
           <p className="text-slate-300 text-xs leading-relaxed font-light font-sans">
-            Timing thresholds indicate high conviction windows. The alignment of **{technical.trend_strength ? technical.trend_strength.toLowerCase() : "moderate"}** technical momentum indicators with a **{sentiment.sentiment ? sentiment.sentiment.toLowerCase() : "neutral"}** sentiment feed suggests **{bias === "BULLISH" ? "opportunistic accumulation buffers" : "defensive reallocation postures"}** should be considered immediately, targeting catalysts tagged under **{sentiment.catalyst_type || "WWDC & AI hardware releases"}** timelines.
+            Timing thresholds indicate high conviction windows. The alignment of <strong className="text-white font-medium">{technical.trend_strength ? technical.trend_strength.toLowerCase() : "moderate"}</strong> technical momentum indicators with a <strong className="text-white font-medium">{sentiment.sentiment ? sentiment.sentiment.toLowerCase() : "neutral"}</strong> sentiment feed suggests <strong className="text-white font-medium">{bias === "BULLISH" ? "opportunistic accumulation buffers" : "defensive reallocation postures"}</strong> should be considered immediately, targeting catalysts tagged under <strong className="text-white font-medium">{sentiment.catalyst_type || "Earnings & Corporate Catalysts"}</strong> timelines.
           </p>
         </section>
 

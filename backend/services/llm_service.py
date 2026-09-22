@@ -13,7 +13,7 @@ load_dotenv()
 logger = logging.getLogger("quantum_agent.llm_service")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 import re
 
