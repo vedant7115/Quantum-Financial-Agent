@@ -91,8 +91,9 @@ def analyze(news_data: dict) -> dict:
         calculated_reason = f"Balanced sentiment flow ({pos_count} positive, {neg_count} negative, {neu_count} neutral)."
         
     # ── LLM Orchestration & Fallback check ──
+    enable_subagent_llm = os.getenv("ENABLE_SUBAGENT_LLM", "false").lower() == "true"
     groq_api_key = os.getenv("GROQ_API_KEY")
-    if groq_api_key:
+    if groq_api_key and enable_subagent_llm:
         try:
             logger.info("GROQ_API_KEY detected. Prompting Groq sentiment agent...")
             

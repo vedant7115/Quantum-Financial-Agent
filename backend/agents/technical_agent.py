@@ -140,8 +140,9 @@ def analyze(stock_data: dict, timeframe_data: dict = None) -> dict:
     rule_risk_factors = ["High market volatility" if volatility >= 35.0 else "Normal asset volatility"]
     
     # ── LLM Query & Fallback orchestrator ──
+    enable_subagent_llm = os.getenv("ENABLE_SUBAGENT_LLM", "false").lower() == "true"
     groq_api_key = os.getenv("GROQ_API_KEY")
-    if groq_api_key:
+    if groq_api_key and enable_subagent_llm:
         try:
             logger.info("GROQ_API_KEY detected. Prompting Groq technical analysis agent...")
             

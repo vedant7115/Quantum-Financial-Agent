@@ -87,7 +87,9 @@ def query_groq(prompt: str, system_prompt: str = None, response_json: bool = Tru
                 return content
         except Exception as e:
             last_err = e
-            logger.warning(f"Groq API connection attempt {attempt + 1} failed: {str(e)}")
+            err_body = getattr(e, "response", None)
+            err_detail = err_body.text if err_body is not None else ""
+            logger.warning(f"Groq API connection attempt {attempt + 1} failed: {str(e)} | Details: {err_detail}")
             if attempt < max_retries:
                 import time
                 time.sleep(backoff * (attempt + 1))
