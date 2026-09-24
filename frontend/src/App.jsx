@@ -184,9 +184,11 @@ function App() {
       <header className="border-b border-white/5 bg-[#05060f]/80 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2.5 cursor-pointer" onClick={() => setCurrentPage("Home")}>
-            <div className="w-8 h-8 rounded bg-[#FFBA9D] flex items-center justify-center">
-              <span className="text-black font-black text-sm">Q</span>
-            </div>
+            <img 
+              src="/LOGO.jpeg" 
+              alt="Quantum Intel Logo" 
+              className="w-8 h-8 rounded-lg object-contain"
+            />
             <span className="font-bold text-[15px] tracking-wider text-white uppercase" style={{ fontFamily: "'General Sans', sans-serif" }}>
               QUANTUM INTEL
             </span>

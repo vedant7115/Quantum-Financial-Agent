@@ -13,13 +13,11 @@ function Header({ currentPage, setCurrentPage }) {
 
         {/* ── Logo ───────────────────────────────────────────────────────── */}
         <div className="flex items-center gap-3 cursor-pointer" onClick={() => setCurrentPage("Home")}>
-          <div className="relative">
-            <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center shadow-lg">
-              <span className="text-white font-bold text-base">Q</span>
-            </div>
-            {/* Soft glow behind logo */}
-            <div className="absolute inset-0 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 blur-sm opacity-20 -z-10" />
-          </div>
+          <img 
+            src="/LOGO.jpeg" 
+            alt="Quantum Logo" 
+            className="w-9 h-9 rounded-lg object-contain shadow-lg"
+          />
 
           <div>
             <h1 className="font-bold text-lg tracking-wider text-white" style={{ fontFamily: "'General Sans', sans-serif" }}>
