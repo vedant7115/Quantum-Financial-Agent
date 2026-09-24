@@ -7,8 +7,8 @@ export default function ResearchSourcesCard({ systemStatus, totalArticles, isFal
   const { groq_status, execution_time_sec } = systemStatus;
 
   const groqLower = (groq_status || "").toLowerCase();
-  const aiCalls = groqLower === "online" ? 4 : 0;
-  const aiModel = groqLower === "fallback mode" ? "Heuristic Rules (Fallback)" : "Llama 3.3 70B (Groq)";
+  const aiCalls = groqLower === "online" ? 1 : 0;
+  const aiModel = groqLower === "fallback mode" ? "Heuristic Rules (Fallback)" : "OpenAI GPT-OSS-20B (Groq)";
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6 fade-in-up" style={{ animationDelay: "0.2s" }}>

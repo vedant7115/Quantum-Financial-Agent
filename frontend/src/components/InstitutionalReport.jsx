@@ -1382,7 +1382,7 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
                 </div>
                 <div className="bg-slate-950/50 p-3 rounded border border-white/5">
                   <span className="text-slate-550 text-slate-500 text-[8px] font-bold block uppercase mb-1">Model Inference Engine</span>
-                  <span className="text-white font-bold text-xs">Llama-3.3-70b-versatile (Groq)</span>
+                  <span className="text-white font-bold text-xs">OpenAI GPT-OSS-20B (Groq)</span>
                 </div>
               </div>
 
@@ -1391,7 +1391,7 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
                 <ul className="space-y-1.5 text-[10px] text-slate-400 leading-relaxed">
                   <li><strong>Yahoo Finance API:</strong> Live daily OHLCV closing history, market caps, net income, PE, and provider feed streams.</li>
                   <li><strong>Google News RSS Feed:</strong> Backup XML headline feed, parsed and mapped to keywords local lexicon sentiment tags.</li>
-                  <li><strong>Groq Gateway API:</strong> Llama 3.3 70B model gateway utilizing strict 10s connection limits with fallback routines.</li>
+                  <li><strong>Groq Gateway API:</strong> OpenAI GPT-OSS-20B reasoning gateway for master institutional synthesis.</li>
                   <li><strong>Internal Quant Engine:</strong> Deterministic technical indicators calculations (50d/200d MA crosses, RSI vectors, volatility metrics).</li>
                 </ul>
               </div>

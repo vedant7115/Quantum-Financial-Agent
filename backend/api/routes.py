@@ -152,12 +152,7 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         logger.info(f"Returning cached analysis for symbol: {symbol}")
         try:
             cache_info = cache_service.get_cache_info(symbol)
-            fallback_active = (
-                cached_result.get("technical", {}).get("fallback_active", False) or
-                cached_result.get("fundamental", {}).get("fallback_active", False) or
-                cached_result.get("sentiment", {}).get("fallback_active", False) or
-                cached_result.get("final_decision", {}).get("fallback_active", False)
-            )
+            fallback_active = cached_result.get("final_decision", {}).get("fallback_active", False)
             cached_result["system_status"] = {
                 "backend_status": "Online",
                 "groq_status": "Fallback Mode" if fallback_active else ("Online" if os.getenv("GROQ_API_KEY") else "Offline"),
@@ -243,12 +238,7 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     # Attach raw articles to sentiment result for frontend News Insights presentation
     sentiment_result["articles"] = news_data.get("articles", [])
 
-    fallback_active = (
-        technical_result.get("fallback_active", False) or
-        fundamental_result.get("fallback_active", False) or
-        sentiment_result.get("fallback_active", False) or
-        final_decision.get("fallback_active", False)
-    )
+    fallback_active = final_decision.get("fallback_active", False)
     exec_time = round(time.perf_counter() - start_time, 3)
 
     system_status = {
