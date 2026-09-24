@@ -169,12 +169,14 @@ function LandingPage({ onStartResearch, onViewArchitecture }) {
         <div className="max-w-[1400px] mx-auto px-8 py-5 flex items-center justify-between">
           {/* Logo */}
           <div 
-            className="flex items-center gap-2 cursor-pointer" 
+            className="flex items-center gap-2.5 cursor-pointer" 
             onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
           >
-            <div className="w-7 h-7 rounded bg-[#FFBA9D] flex items-center justify-center">
-              <span className="text-black font-black text-[13px] tracking-tight">Q</span>
-            </div>
+            <img 
+              src="/LOGO.jpeg" 
+              alt="Quantum Logo" 
+              className="w-7 h-7 rounded-lg object-contain"
+            />
             <span className="font-bold text-[15px] tracking-wider text-white uppercase" style={{ fontFamily: "'General Sans', sans-serif" }}>
               QUANTUM
             </span>
@@ -888,10 +890,12 @@ function LandingPage({ onStartResearch, onViewArchitecture }) {
           
           {/* Logo & details */}
           <div className="space-y-4 font-sans">
-            <div className="flex items-center gap-2">
-              <div className="w-6 h-6 rounded bg-[#FFBA9D] flex items-center justify-center">
-                <span className="text-black font-black text-xs">Q</span>
-              </div>
+            <div className="flex items-center gap-2.5">
+              <img 
+                src="/LOGO.jpeg" 
+                alt="Quantum Logo" 
+                className="w-6 h-6 rounded-md object-contain"
+              />
               <span className="font-bold text-sm text-white uppercase tracking-wider">QUANTUM</span>
             </div>
             <p className="text-slate-500 text-[11px] leading-relaxed">
