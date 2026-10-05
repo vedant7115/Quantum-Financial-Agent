@@ -128,3 +128,30 @@ Before shipping to production, verify:
 - [x] CORS middleware supports production and preview URLs
 - [x] End-to-end integration test passes: `python backend/test_verification.py`
 - [x] SPA rewrites configured for direct URLs in `frontend/vercel.json`
+
+---
+
+## 6. 🕒 Keeping Free-Tier Services Alive 24/7 (Preventing Sleep & Cold Starts)
+
+Free-tier cloud hosts (such as **Render**) spin down web services into a sleeping state after **15 minutes of inactivity**. When a new visitor accesses the app, the container undergoes a **cold start** (taking 30–50 seconds to boot), causing initial delays or timeouts.
+
+We provide 3 easy solutions to keep your backend awake 24/7:
+
+### Option 1: Free Uptime Robot / Cron-Job.org (Recommended — 100% Reliable & Zero Maintenance)
+1. Sign up for a free account at [UptimeRobot](https://uptimerobot.com) or [cron-job.org](https://cron-job.org).
+2. Create a new **HTTP(s) Monitor**:
+   - **URL**: `https://<your-render-url>/health` (e.g. `https://quantum-agent-api.onrender.com/health`)
+   - **Monitoring Interval**: Every `5` or `10` minutes.
+3. Because the ping arrives every 5–10 minutes, Render never reaches the 15-minute inactivity threshold and stays awake 24/7!
+
+### Option 2: Automated GitHub Actions Keep-Alive (Zero Setup Required)
+A pre-configured GitHub Actions workflow is provided at `.github/workflows/keep_alive.yml`.
+- Runs automatically every 10 minutes on GitHub runners to ping your backend health endpoint.
+- To set your production URL: In your GitHub Repository, go to **Settings** → **Secrets and variables** → **Actions** → **Variables** → Add `BACKEND_URL` with your Render URL (e.g., `https://quantum-agent-api.onrender.com`).
+
+### Option 3: Local / Server Keep-Alive Daemon
+If you have a local machine or home server, you can run the included Python daemon:
+```bash
+python scripts/keep_alive.py https://quantum-agent-api.onrender.com 10
+```
+

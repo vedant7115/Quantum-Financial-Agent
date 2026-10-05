@@ -36,9 +36,9 @@ export async function checkHealth() {
 /**
  * Perform a root health check (GET /health) to verify connectivity.
  */
-export async function checkBackendHealth() {
+export async function checkBackendHealth(timeoutMs = 20000) {
   const healthUrl = `${ROOT_URL}/health`;
-  const response = await axios.get(healthUrl, { timeout: 8000 });
+  const response = await axios.get(healthUrl, { timeout: timeoutMs });
   return response.data;
 }
 

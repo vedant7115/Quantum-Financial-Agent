@@ -5,7 +5,7 @@ import ArchitecturePage from "./components/ArchitecturePage";
 import NewsInsights from "./components/NewsInsights";
 import LandingPage from "./components/LandingPage";
 import InstitutionalReport from "./components/InstitutionalReport";
-import { analyzeStock, getStockData, checkBackendHealth } from "./api";
+import { analyzeStock, getStockData, checkBackendHealth, ROOT_URL } from "./api";
 import { 
   TrendingUp, 
   Landmark, 
@@ -42,21 +42,43 @@ function App() {
   const [activeModal, setActiveModal] = useState(null);
   const [searchInputValue, setSearchInputValue] = useState("");
 
-  // Verify backend server availability
+  // Verify backend server availability & periodic keep-alive heartbeat
   useEffect(() => {
-    async function verifyBackendConnection() {
+    let isMounted = true;
+    let retryTimeoutId = null;
+
+    async function verifyBackendConnection(attempt = 1) {
       try {
-        const data = await checkBackendHealth();
-        if (data && data.status === "ok") {
-          setBackendHealth({ checked: true, online: true });
-        } else {
-          setBackendHealth({ checked: true, online: false });
+        const data = await checkBackendHealth(15000);
+        if (data && (data.status === "ok" || data.status === "online")) {
+          if (isMounted) setBackendHealth({ checked: true, online: true, wakingUp: false });
+          return;
         }
       } catch (err) {
-        setBackendHealth({ checked: true, online: false });
+        // Cold start detection: On Render/free-tier, instances wake up in 30-45s
+        if (attempt <= 4) {
+          if (isMounted) setBackendHealth({ checked: true, online: false, wakingUp: true });
+          retryTimeoutId = setTimeout(() => {
+            if (isMounted) verifyBackendConnection(attempt + 1);
+          }, 5000);
+          return;
+        }
       }
+      if (isMounted) setBackendHealth({ checked: true, online: false, wakingUp: false });
     }
+
     verifyBackendConnection();
+
+    // Heartbeat: ping /health every 8 minutes to keep cloud backend alive while tab is open
+    const heartbeatInterval = setInterval(() => {
+      checkBackendHealth(10000).catch(() => {});
+    }, 8 * 60 * 1000);
+
+    return () => {
+      isMounted = false;
+      if (retryTimeoutId) clearTimeout(retryTimeoutId);
+      clearInterval(heartbeatInterval);
+    };
   }, []);
 
   // Search History State (loaded from LocalStorage)
@@ -239,30 +261,41 @@ function App() {
       ) : (
         <main className="max-w-6xl mx-auto px-6 py-10 relative z-10 space-y-6">
           
-          {/* Diagnostic warning alert when FastAPI backend is offline */}
+          {/* Diagnostic status alert when FastAPI backend is waking up or offline */}
           {backendHealth.checked && !backendHealth.online && (
-            <div className="bg-red-950/20 border border-red-500/20 rounded p-5 relative overflow-hidden fade-in-up">
-              <h3 className="text-red-400 font-bold font-mono text-xs uppercase tracking-wide mb-2 flex items-center gap-1.5">
-                <span>🚨</span> FastAPI Backend Gateway Offline
-              </h3>
-              <p className="text-slate-300 text-[11px] leading-relaxed">
-                The client cannot establish a connection with the FastAPI backend at <code className="px-1.5 py-0.5 rounded bg-black/40 text-rose-350 font-mono text-[10.5px]">http://localhost:8000</code>. Verify uvicorn server status.
-              </p>
-              <div className="mt-3.5 flex gap-2">
-                <button 
-                  onClick={() => window.location.reload()} 
-                  className="px-4 py-1.5 rounded bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold transition font-mono uppercase tracking-wider"
-                >
-                  🔄 Retry Connection
-                </button>
-                <button 
-                  onClick={() => setBackendHealth({ checked: true, online: true })} 
-                  className="px-4 py-1.5 rounded border border-slate-700 hover:border-slate-500 text-slate-400 hover:text-white text-[10px] font-bold transition font-mono uppercase tracking-wider"
-                >
-                  Bypass Alert
-                </button>
+            backendHealth.wakingUp ? (
+              <div className="bg-amber-950/20 border border-amber-500/30 rounded p-4 relative overflow-hidden fade-in-up">
+                <h3 className="text-amber-400 font-bold font-mono text-xs uppercase tracking-wide mb-1.5 flex items-center gap-2">
+                  <span className="inline-block animate-spin text-sm">⏳</span> Cloud Server is Waking Up...
+                </h3>
+                <p className="text-slate-300 text-[11px] leading-relaxed">
+                  The backend service at <code className="px-1.5 py-0.5 rounded bg-black/40 text-amber-300 font-mono text-[10.5px]">{ROOT_URL}</code> was sleeping due to inactivity. Cloud free-tiers (like Render) take ~30–45s to spin up. Auto-reconnecting in the background...
+                </p>
               </div>
-            </div>
+            ) : (
+              <div className="bg-red-950/20 border border-red-500/20 rounded p-5 relative overflow-hidden fade-in-up">
+                <h3 className="text-red-400 font-bold font-mono text-xs uppercase tracking-wide mb-2 flex items-center gap-1.5">
+                  <span>🚨</span> FastAPI Backend Gateway Offline
+                </h3>
+                <p className="text-slate-300 text-[11px] leading-relaxed">
+                  The client cannot establish a connection with the FastAPI backend at <code className="px-1.5 py-0.5 rounded bg-black/40 text-rose-350 font-mono text-[10.5px]">{ROOT_URL}</code>. Verify the server is running or deployed.
+                </p>
+                <div className="mt-3.5 flex gap-2">
+                  <button 
+                    onClick={() => window.location.reload()} 
+                    className="px-4 py-1.5 rounded bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold transition font-mono uppercase tracking-wider"
+                  >
+                    🔄 Retry Connection
+                  </button>
+                  <button 
+                    onClick={() => setBackendHealth({ checked: true, online: true, wakingUp: false })} 
+                    className="px-4 py-1.5 rounded border border-slate-700 hover:border-slate-500 text-slate-400 hover:text-white text-[10px] font-bold transition font-mono uppercase tracking-wider"
+                  >
+                    Bypass Alert
+                  </button>
+                </div>
+              </div>
+            )
           )}
 
           {/* Error Banner / Beautiful Invalid Ticker Screen */}

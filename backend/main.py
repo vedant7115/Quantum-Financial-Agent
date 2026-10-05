@@ -51,7 +51,7 @@ app.include_router(router, prefix="/api")
 
 
 # ── Root & Health Endpoints ──────────────────────────────────────────────────
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     """Welcome message and metadata for the API root."""
     return {
@@ -68,9 +68,10 @@ async def root():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 async def root_health():
-    """Liveness probe / health check for cloud load balancers and orchestrators."""
+    """Liveness probe / health check for cloud load balancers, orchestrators, and keep-alive pings."""
     return {
         "status": "ok",
         "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),

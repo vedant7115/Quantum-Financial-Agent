@@ -1,0 +1,29 @@
+name: Keep Backend Alive
+
+on:
+  schedule:
+    # Run every 10 minutes to prevent Render free-tier from sleeping (Render sleeps after 15 mins)
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+
+jobs:
+  ping:
+    name: Ping Health Endpoint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Backend Health Endpoint
+        run: |
+          BACKEND_URL="${{ vars.BACKEND_URL || 'https://quantum-financial-agent.onrender.com' }}"
+          # Strip trailing slashes
+          BACKEND_URL="${BACKEND_URL%/}"
+          TARGET_URL="${BACKEND_URL}/health"
+          echo "Pinging $TARGET_URL to keep backend instance warm..."
+          
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$TARGET_URL" || echo "FAILED")
+          echo "HTTP Response Code: $RESPONSE"
+          
+          if [ "$RESPONSE" = "200" ]; then
+            echo "✅ Backend is healthy and awake!"
+          else
+            echo "⚠️ Backend responded with code $RESPONSE (it may have been waking up, or URL needs updating)."
+          fi
