@@ -5,7 +5,9 @@ import ArchitecturePage from "./components/ArchitecturePage";
 import NewsInsights from "./components/NewsInsights";
 import LandingPage from "./components/LandingPage";
 import InstitutionalReport from "./components/InstitutionalReport";
-import { analyzeStock, getStockData, checkBackendHealth, ROOT_URL } from "./api";
+import PricingPage from "./components/PricingPage";
+import { analyzeStock, getStockData, getUsage, checkBackendHealth, ROOT_URL } from "./api";
+import "./styles/quantum-next.css";
 import { 
   TrendingUp, 
   Landmark, 
@@ -41,6 +43,13 @@ function App() {
   const [backendHealth, setBackendHealth] = useState({ checked: false, online: null });
   const [activeModal, setActiveModal] = useState(null);
   const [searchInputValue, setSearchInputValue] = useState("");
+  const [access, setAccess] = useState(null);       // plan, locked sections, usage
+  const [quotaReached, setQuotaReached] = useState(false);
+
+  // Load the caller's plan and remaining reports once the page opens
+  useEffect(() => {
+    getUsage().then(setAccess).catch(() => {});
+  }, []);
 
   // Verify backend server availability & periodic keep-alive heartbeat
   useEffect(() => {
@@ -100,6 +109,7 @@ function App() {
     
     setIsLoading(true);
     setError(null);
+    setQuotaReached(false);
     setAnalysisData(null);
     setStockInfoData(null);
     
@@ -117,10 +127,12 @@ function App() {
     });
 
     try {
+      // The report is the thing that must succeed; the extra stock detail is optional.
       const fetchPromise = Promise.all([
         analyzeStock(cleanSym),
-        getStockData(cleanSym),
+        getStockData(cleanSym).catch(() => null),
       ]);
+      fetchPromise.catch(() => {}); // handled below once the stage animation finishes
 
       // Step-by-step pipeline visualization delay
       await delay(600);
@@ -148,13 +160,22 @@ function App() {
       await delay(400);
       setAnalysisData(analysis);
       setStockInfoData(stockInfo);
+      if (analysis.access) setAccess(analysis.access);
       setWorkflowStep(0); // Reset workflow step once finished
     } catch (err) {
       setWorkflowStep(0);
-      if (err.code === "ERR_NETWORK") {
-        setError("Cannot establish connection with the FastAPI gateway. Ensure the backend is running on port 8000.");
+      const detail = err.response?.data?.detail;
+      if (err.response?.status === 402 && detail?.code === "QUOTA_EXCEEDED") {
+        setAccess(detail);
+        setQuotaReached(true);
+      } else if (err.code === "ERR_NETWORK") {
+        setError("We could not reach the research server. Please try again in a moment.");
+      } else if (detail === "DATA_UNAVAILABLE") {
+        setError("Market data for this company is temporarily unavailable, so no report was generated. Please try again shortly.");
+      } else if (detail === "RATE_LIMIT_EXCEEDED") {
+        setError("Too many requests in a short time. Please wait a minute and try again.");
       } else {
-        setError(err.response?.data?.detail || "Analysis pipeline failed. Verify ticker format.");
+        setError(typeof detail === "string" ? detail : "The analysis could not be completed. Check the ticker and try again.");
       }
     } finally {
       setIsLoading(false);
@@ -163,6 +184,10 @@ function App() {
 
   function handleExportPDF() {
     if (!analysisData) return;
+    if (access && !access.pdf_export) {
+      setCurrentPage("Pricing");
+      return;
+    }
     const originalTitle = document.title;
     document.title = `QUANTUM_REPORT_${analysisData.stock}_${new Date().toISOString().split('T')[0]}`;
     window.print();
@@ -235,6 +260,12 @@ function App() {
             >
               Architecture
             </button>
+            <button
+              onClick={() => setCurrentPage("Pricing")}
+              className={`px-3 py-1 rounded transition ${currentPage === "Pricing" ? "bg-white/10 text-white font-semibold" : "text-slate-400 hover:text-white"}`}
+            >
+              Pricing
+            </button>
           </nav>
         </div>
       </header>
@@ -247,6 +278,11 @@ function App() {
             if (sym) handleSearch(sym);
           }}
           onViewArchitecture={() => setCurrentPage("Architecture")}
+        />
+      ) : currentPage === "Pricing" ? (
+        <PricingPage
+          onStartResearch={() => setCurrentPage("Dashboard")}
+          onAccessChange={setAccess}
         />
       ) : currentPage === "Architecture" ? (
         <ArchitecturePage systemStatus={analysisData?.system_status || (backendHealth.online ? {
@@ -344,6 +380,25 @@ function App() {
             )
           )}
 
+          {/* Daily limit reached: offer the upgrade instead of an error */}
+          {quotaReached && !isLoading && (
+            <div className="qx qx-panel fade-in-up">
+              <h3 className="qx-h3">You have used today's free reports</h3>
+              <p className="qx-body" style={{ marginTop: 8 }}>
+                The {access?.plan_name || "Free"} plan includes {access?.usage?.limit ?? 3} reports a day.
+                Companies you already opened today stay available. Your limit resets at midnight UTC.
+              </p>
+              <button
+                type="button"
+                className="qx-btn qx-btn-primary qx-btn-inline"
+                style={{ marginTop: 24 }}
+                onClick={() => setCurrentPage("Pricing")}
+              >
+                See plans
+              </button>
+            </div>
+          )}
+
           {/* ── CASE 1: IDLE / LOADING SEARCH SCREEN (Screenshot 2 style) ── */}
           {(!analysisData || isLoading) && (
             <div className="space-y-12 py-10 fade-in-up">
@@ -385,6 +440,24 @@ function App() {
                     {isLoading ? "Executing..." : "Execute"}
                   </button>
                 </form>
+
+                {access?.usage && (
+                  <p className="qx-meter" style={{ textAlign: "center", marginTop: 12 }}>
+                    <strong>{access.usage.remaining}</strong> of {access.usage.limit} reports left today on {access.plan_name}
+                    {access.plan === "free" && (
+                      <>
+                        {" · "}
+                        <button
+                          type="button"
+                          onClick={() => setCurrentPage("Pricing")}
+                          style={{ color: "#2997ff", background: "none", border: 0, padding: 0, cursor: "pointer", fontSize: 13 }}
+                        >
+                          Upgrade
+                        </button>
+                      </>
+                    )}
+                  </p>
+                )}
 
                 {/* Popular Chips */}
                 <div className="mt-3.5 flex items-center justify-center gap-1.5 flex-wrap font-mono text-[9px] text-slate-500 font-bold uppercase">
@@ -519,7 +592,7 @@ function App() {
                     onClick={handleExportPDF}
                     className="w-full sm:w-auto px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-mono text-[10px] font-bold uppercase tracking-wider transition shrink-0 cursor-pointer"
                   >
-                    Export Report
+                    {access && !access.pdf_export ? "Export Report · Pro" : "Export Report"}
                   </button>
                 </div>
               </div>
@@ -528,6 +601,8 @@ function App() {
                 analysisData={analysisData}
                 stockInfo={stockInfoData}
                 isFallbackActive={isFallbackActive}
+                access={access}
+                onUpgrade={() => setCurrentPage("Pricing")}
               />
 
             </div>

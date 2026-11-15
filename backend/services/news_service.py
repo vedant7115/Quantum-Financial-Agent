@@ -5,6 +5,7 @@
 import yfinance as yf
 import xml.etree.ElementTree as ET
 import httpx
+import os
 import random
 import logging
 
@@ -174,11 +175,15 @@ def get_news(symbol: str) -> dict:
         articles = fetch_rss_news(resolved_symbol)
         source_label = "Google News RSS (XML Fallback)"
         
-    # If still empty, use mock generator
+    # No real news found. Report that honestly: an empty list, never invented
+    # headlines. Mock headlines exist only for offline development.
     if not articles:
-        mock_data = get_mock_news(symbol)
-        articles = mock_data["articles"]
-        source_label = mock_data["source"]
+        if os.getenv("ALLOW_MOCK_DATA", "false").lower() == "true":
+            mock_data = get_mock_news(symbol)
+            articles = mock_data["articles"]
+            source_label = mock_data["source"]
+        else:
+            source_label = "No recent news available"
         
     return {
         "symbol": resolved_symbol,
@@ -203,7 +208,7 @@ def get_mock_news(symbol: str) -> dict:
         articles.append({
             "title": headline.format(sym=symbol),
             "sentiment": "positive",
-            "source": "MarketWatch",
+            "source": "Mock News Engine",
             "link": "#",
             "publish_time": now_str
         })
@@ -212,7 +217,7 @@ def get_mock_news(symbol: str) -> dict:
         articles.append({
             "title": headline.format(sym=symbol),
             "sentiment": "negative",
-            "source": "Reuters",
+            "source": "Mock News Engine",
             "link": "#",
             "publish_time": now_str
         })
@@ -221,7 +226,7 @@ def get_mock_news(symbol: str) -> dict:
         articles.append({
             "title": headline.format(sym=symbol),
             "sentiment": "neutral",
-            "source": "Bloomberg",
+            "source": "Mock News Engine",
             "link": "#",
             "publish_time": now_str
         })

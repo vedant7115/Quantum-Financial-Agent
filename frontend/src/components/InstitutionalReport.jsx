@@ -13,6 +13,7 @@ import {
   Tooltip
 } from "recharts";
 import TradingViewChart from "./TradingViewChart";
+import LockedSection from "./LockedSection";
 
 // Helper for circular gauge stroke-dashoffset calculations
 const calculateStrokeOffset = (score, r) => {
@@ -35,7 +36,7 @@ const renderFormattedText = (text) => {
   });
 };
 
-export default function InstitutionalReport({ analysisData, stockInfo, isFallbackActive }) {
+export default function InstitutionalReport({ analysisData, stockInfo, isFallbackActive, access, onUpgrade }) {
   const [activeTimeframe, setActiveTimeframe] = useState("1d");
   const [telemetryCollapsed, setTelemetryCollapsed] = useState(true);
   const [simCapital, setSimCapital] = useState(50000);
@@ -72,6 +73,11 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
   const fundamental = analysisData.fundamental || {};
   const sentiment = analysisData.sentiment || {};
   const finalDecision = analysisData.final_decision || {};
+
+  // Sections the caller's plan does not include. The server has already removed
+  // their content from the response; this only decides what to draw in their place.
+  const lockedSections = new Set((analysisData.access || access)?.locked_sections || []);
+  const fundamentalsMissing = fundamental.data_available === false;
 
   const bias = (finalDecision.market_bias || "Neutral").toUpperCase();
   const risk = (finalDecision.risk || "Medium").toUpperCase();
@@ -225,6 +231,13 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 text-slate-100">
+
+      {fundamentalsMissing && (
+        <div role="status" className="lg:col-span-12 rounded-lg border border-amber-500/30 bg-amber-500/5 px-5 py-4 text-amber-200" style={{ fontSize: 15, lineHeight: 1.45 }}>
+          Company financials could not be retrieved for this report. Fundamental scores below are not assessed,
+          and the overall view is based on price action and news only.
+        </div>
+      )}
       
       {/* ── STICKY SIDEBAR NAVIGATION (lg:col-span-3) ── */}
       <aside className="lg:col-span-3 h-fit sticky top-6 hidden lg:block z-10 select-none">
@@ -1035,6 +1048,9 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
         </section>
 
         {/* ── SECTION 8: BULL CASE VS BEAR CASE ── */}
+        {lockedSections.has("debate") ? (
+          <LockedSection id="debate" title="Bull vs bear debate" description="The strongest arguments on each side, drawn from all three agents." onUpgrade={onUpgrade} />
+        ) : (
         <section id="debate" data-section className="space-y-3">
           <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-widest block">SECTION 8 — DEBATE: BULL CASE VS BEAR CASE</span>
           
@@ -1074,6 +1090,7 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
             </div>
           </div>
         </section>
+        )}
 
         {/* ── SECTION 9: SCENARIO PATHWAYS (SCENARIO ANALYSIS) ── */}
         <section id="scenarios" data-section className="bg-[#0a0c16] border border-white/10 rounded-lg p-5 space-y-4">
@@ -1164,6 +1181,9 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
         </section>
 
         {/* ── SECTION 11: RISK REGISTER ── */}
+        {lockedSections.has("risks") ? (
+          <LockedSection id="risks" title="Risk register" description="Six categories of risk, each rated by severity and probability." onUpgrade={onUpgrade} />
+        ) : (
         <section id="risks" data-section className="bg-[#0a0c16] border border-white/10 rounded-lg p-5 space-y-4">
           <div className="border-b border-white/5 pb-3">
             <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-widest block">SECTION 11 — RISK REGISTER MATRIX</span>
@@ -1204,8 +1224,12 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
             </table>
           </div>
         </section>
+        )}
 
         {/* ── SECTION 12: CATALYST CALENDAR ── */}
+        {lockedSections.has("calendar") ? (
+          <LockedSection id="calendar" title="Catalyst calendar" description="Upcoming events that could move the stock, and how." onUpgrade={onUpgrade} />
+        ) : (
         <section id="calendar" data-section className="bg-[#0a0c16] border border-white/10 rounded-lg p-5 space-y-4">
           <div className="border-b border-white/5 pb-3">
             <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-widest block">SECTION 12 — CATALYST CALENDAR</span>
@@ -1245,6 +1269,7 @@ export default function InstitutionalReport({ analysisData, stockInfo, isFallbac
             </table>
           </div>
         </section>
+        )}
 
         {/* ── SECTION 13: INVESTMENT CHECKLIST ── */}
         <section id="checklist" data-section className="bg-[#0a0c16] border border-white/10 rounded-lg p-5 space-y-4">

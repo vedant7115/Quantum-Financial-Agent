@@ -52,6 +52,7 @@ class FundamentalResult(BaseModel):
     weaknesses: List[str]          # Core capital/solvency risks
     metrics: Dict[str, Any]         # Dictionary of raw data metrics
     fallback_active: bool = False   # True if fallback engine was activated
+    data_available: bool = True     # False when company financials could not be fetched
     growth_outlook: str = ""        # V2 field
     valuation_outlook: str = ""    # V2 field
     ai_commentary: str = ""         # V2 field
@@ -119,4 +120,5 @@ class AnalyzeResponse(BaseModel):
     final_decision: FinalDecision
     system_status: SystemStatus = None # System performance & fallback statistics
     timeline: List[Dict[str, Any]] = [] # Stage execution timeline logs
+    access: Optional[Dict[str, Any]] = None # Caller's plan, locked sections and usage
 

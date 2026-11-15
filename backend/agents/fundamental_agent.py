@@ -24,7 +24,36 @@ def analyze(stock_data: dict) -> dict:
     net_inc = stock_data.get("net_income", 0.0)
     market_cap = stock_data.get("market_cap", "N/A")
     symbol = stock_data.get("symbol", "Ticker")
-    
+
+    # No financial statements came back from the data provider. Say so plainly
+    # instead of scoring the missing numbers as if the company were weak.
+    if not stock_data.get("fundamentals_available", True):
+        unavailable = "Company financial data could not be retrieved for this report, so fundamentals were not assessed."
+        return {
+            "fundamental": "Unavailable",
+            "confidence": 0,
+            "reason": unavailable,
+            "summary": unavailable,
+            "health_score": 0,
+            "valuation_score": 0,
+            "growth_score": 0,
+            "strengths": [],
+            "weaknesses": [],
+            "metrics": {
+                "pe_ratio": None,
+                "revenue_growth_pct": None,
+                "earnings_growth_pct": None,
+                "market_cap": market_cap,
+                "total_revenue": None,
+                "net_income": None,
+            },
+            "fallback_active": True,
+            "data_available": False,
+            "growth_outlook": "Not assessed: financial data unavailable.",
+            "valuation_outlook": "Not assessed: financial data unavailable.",
+            "ai_commentary": unavailable,
+        }
+
     reasons = []
     
     # ── Calculated Core (Fallback Metrics) ──

@@ -6,7 +6,27 @@
 import os
 import json
 import logging
+import re
+from datetime import date, datetime
 from services.llm_service import query_groq
+
+
+def _drop_past_catalysts(calendar: list) -> list:
+    """Removes catalyst entries whose date is clearly in the past. The model has
+    no calendar, so it sometimes lists events that have already happened."""
+    today = date.today()
+    kept = []
+    for item in calendar:
+        text = str(item.get("expected_date", "")) if isinstance(item, dict) else ""
+        match = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
+        if match:
+            try:
+                if datetime.strptime(match.group(0), "%Y-%m-%d").date() < today:
+                    continue
+            except ValueError:
+                pass
+        kept.append(item)
+    return kept
 
 logger = logging.getLogger("quantum_agent.master_agent")
 
@@ -27,10 +47,18 @@ def analyze(technical: dict, fundamental: dict, sentiment: dict) -> dict:
     fund_conf = fundamental.get("confidence", 50)
     sent_conf = sentiment.get("confidence", 50)
     
+    # When fundamentals could not be fetched that agent is left out and the
+    # remaining weights are scaled up, rather than counting it as a negative.
+    fund_available = fundamental.get("data_available", True)
+    if fund_available:
+        w_tech, w_fund, w_sent = 0.40, 0.35, 0.25
+    else:
+        w_tech, w_fund, w_sent = 0.40 / 0.65, 0.0, 0.25 / 0.65
+
     calculated_confidence = int(
-        (tech_conf * 0.40) + 
-        (fund_conf * 0.35) + 
-        (sent_conf * 0.25)
+        (tech_conf * w_tech) + 
+        (fund_conf * w_fund) + 
+        (sent_conf * w_sent)
     )
 
     # ── 2. Calculate Master Risk Score (Explainable Logic) ──
@@ -47,7 +75,7 @@ def analyze(technical: dict, fundamental: dict, sentiment: dict) -> dict:
     f_score = score_map(fundamental.get("fundamental"))
     s_score = score_map(sentiment.get("sentiment"))
     
-    scores = [t_score, f_score, s_score]
+    scores = [t_score, f_score, s_score] if fund_available else [t_score, s_score]
     disagreement_range = max(scores) - min(scores) # 0.0 to 2.0
     disagreement_risk = disagreement_range * 35 # 0, 35, or 70 points
     
@@ -69,7 +97,7 @@ def analyze(technical: dict, fundamental: dict, sentiment: dict) -> dict:
         calculated_risk = "Low"
 
     # ── 3. Rule-Based Bias Fallback ──
-    weighted_score = (t_score * 0.40) + (f_score * 0.35) + (s_score * 0.25)
+    weighted_score = (t_score * w_tech) + (f_score * w_fund) + (s_score * w_sent)
     if weighted_score >= 0.25:
         calculated_bias = "Bullish"
     elif weighted_score <= -0.25:
@@ -80,7 +108,9 @@ def analyze(technical: dict, fundamental: dict, sentiment: dict) -> dict:
     # Key drivers fallback list
     rule_drivers = [
         f"Technical Agent indicates {technical.get('trend')} trend with {technical.get('trend_strength','moderate').lower()} strength.",
-        f"Fundamental Agent reports {fundamental.get('fundamental')} company metrics (Health: {fundamental.get('health_score')}/100).",
+        (f"Fundamental Agent reports {fundamental.get('fundamental')} company metrics (Health: {fundamental.get('health_score')}/100)."
+         if fund_available else
+         "Company financials were unavailable, so this view rests on price action and news only."),
         f"Sentiment Agent evaluates news narrative as {sentiment.get('sentiment')}."
     ]
     
@@ -187,13 +217,33 @@ def analyze(technical: dict, fundamental: dict, sentiment: dict) -> dict:
         f"Valuation multiples are pricing in a premium (PE: {fundamental.get('metrics', {}).get('pe_ratio', 'N/A')}x), risking re-rating.",
         f"Negative headlines or sector headwinds may damp near-term investor interest."
     ]
+    if not fund_available:
+        rule_bull_case[1] = "Company financials were unavailable; the fundamental case could not be assessed."
+        rule_bear_case[1] = "Without financial data, valuation and balance-sheet risk are unknown."
 
     calculated_summary = (
         f"Orchestrated analysis indicates a **{calculated_bias}** market bias with "
         f"an aggregated confidence score of **{calculated_confidence}%** and a **{calculated_risk}** risk profile. "
-        f"Technical momentum aligns as {technical.get('trend')}, coupled with a fundamental health index of {fundamental.get('health_score')}/100 "
-        f"and sentiment drivers matching {sentiment.get('sentiment')}."
+        f"Technical momentum aligns as {technical.get('trend')}, "
+        + (f"coupled with a fundamental health index of {fundamental.get('health_score')}/100 " if fund_available
+           else "company financials were unavailable and are not part of this view, ")
+        + f"and sentiment drivers matching {sentiment.get('sentiment')}."
     )
+
+    if fund_available:
+        fundamental_block = f"""- Solvency/Posture: {fundamental.get('fundamental')}
+- Confidence: {fundamental.get('confidence')}%
+- Health Score: {fundamental.get('health_score')}/100
+- Valuation Score: {fundamental.get('valuation_score')}/100
+- Growth Score: {fundamental.get('growth_score')}/100
+- Strengths: {fundamental.get('strengths')}
+- Weaknesses: {fundamental.get('weaknesses')}
+- Summary: {fundamental.get('summary')}"""
+    else:
+        fundamental_block = """- DATA UNAVAILABLE. Company financials could not be retrieved.
+- Do NOT describe the company's financial health, profitability, valuation or growth.
+- State once in the summary that fundamentals were unavailable and that the view
+  rests on technicals and news only."""
 
     # ── LLM Synthesis & Fallback orchestrator ──
     groq_api_key = os.getenv("GROQ_API_KEY")
@@ -218,14 +268,7 @@ You are an institutional financial analyst. Synthesize the reports from 3 specia
 - Summary: {technical.get('summary')}
 
 [FUNDAMENTAL ANALYSIS REPORT]
-- Solvency/Posture: {fundamental.get('fundamental')}
-- Confidence: {fundamental.get('confidence')}%
-- Health Score: {fundamental.get('health_score')}/100
-- Valuation Score: {fundamental.get('valuation_score')}/100
-- Growth Score: {fundamental.get('growth_score')}/100
-- Strengths: {fundamental.get('strengths')}
-- Weaknesses: {fundamental.get('weaknesses')}
-- Summary: {fundamental.get('summary')}
+{fundamental_block}
 
 [HEADLINE SENTIMENT REPORT]
 - Narrative Verdict: {sentiment.get('sentiment')}
@@ -239,7 +282,7 @@ You are an institutional financial analyst. Synthesize the reports from 3 specia
 - Weighted Consensus Confidence: {calculated_confidence}%
 - Evaluated Risk Classification: {calculated_risk}
 
-Synthesize these inputs. Note that the current date/year is June 2026.
+Synthesize these inputs. Today's date is {date.today().isoformat()}.
 CRITICAL INSTRUCTIONS:
 - You must NOT provide direct investment advice.
 - You must NOT recommend BUY, HOLD, or SELL. Only explain market intelligence.
@@ -270,7 +313,7 @@ Return ONLY a valid JSON object matching this structure:
   "catalyst_calendar": [
     {{
       "event": "Earnings Release" | "Product Launch" | "Investor Day" | "Major Economic Event" | "Industry Event",
-      "expected_date": "Approximate date or timeframe (must be in year 2026 or later)",
+      "expected_date": "Approximate timeframe after today's date. Only give an exact date if it appears in the inputs above; otherwise use a timeframe such as 'Next quarter'",
       "importance": "Low" | "Medium" | "High",
       "potential_impact": "Details of potential stock price impact."
     }}
@@ -285,15 +328,9 @@ Return ONLY the raw JSON. Do not write markdown tags or backticks (no ```json).
             # Post-process catalyst calendar expected_date to ensure years align with 2026 or later
             catalyst_calendar = llm_res.get("catalyst_calendar", rule_catalyst_calendar)
             if isinstance(catalyst_calendar, list):
-                import re
-                for item in catalyst_calendar:
-                    if isinstance(item, dict) and "expected_date" in item and item["expected_date"]:
-                        date_str = str(item["expected_date"])
-                        # Replace 2024 with 2026
-                        date_str = re.sub(r'\b2024\b', '2026', date_str)
-                        # Replace 2025 with 2026 (or keep later years if appropriate)
-                        date_str = re.sub(r'\b2025\b', '2026', date_str)
-                        item["expected_date"] = date_str
+                catalyst_calendar = _drop_past_catalysts(catalyst_calendar)
+            else:
+                catalyst_calendar = rule_catalyst_calendar
 
             return {
                 "market_bias": llm_res.get("market_bias", calculated_bias),

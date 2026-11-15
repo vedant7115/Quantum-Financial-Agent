@@ -6,6 +6,7 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import os
 import random
 import logging
 import requests
@@ -36,6 +37,16 @@ def get_timeout_session(timeout=5.0):
 _yf_session = get_timeout_session(5.0)
 
 logger = logging.getLogger("quantum_agent.stock_service")
+
+
+class MarketDataUnavailable(Exception):
+    """Raised when real market data cannot be fetched for a symbol."""
+
+
+def mock_data_allowed() -> bool:
+    """Mock data is for offline development only. It is never served unless
+    ALLOW_MOCK_DATA=true is set explicitly."""
+    return os.getenv("ALLOW_MOCK_DATA", "false").lower() == "true"
 
 # Common Indian stocks that we auto-resolve to .NS
 INDIAN_TICKERS = {
@@ -210,6 +221,18 @@ def get_stock_data(symbol: str) -> dict:
         # 2. Use already-fetched ticker info for fundamental data
         name = info.get("longName") or info.get("shortName") or f"{symbol} Corp."
         market_cap_raw = info.get("marketCap")
+        if not market_cap_raw:
+            # ticker.info is often blocked on cloud hosts; fast_info usually still works.
+            try:
+                market_cap_raw = getattr(ticker.fast_info, "market_cap", None)
+            except Exception:
+                market_cap_raw = None
+        # Fundamentals count as available only if at least one real financial figure
+        # came back. Without this the agent would score missing data as a weak company.
+        fundamentals_available = any(
+            info.get(k) is not None
+            for k in ("trailingPE", "forwardPE", "totalRevenue", "netIncomeToCommon", "revenueGrowth")
+        )
         if market_cap_raw:
             if market_cap_raw >= 1e12:
                 market_cap = f"${market_cap_raw / 1e12:.2f}T"
@@ -265,12 +288,16 @@ def get_stock_data(symbol: str) -> dict:
             "support": round(safe_float(support, last_price), 2),
             "resistance": round(safe_float(resistance, last_price), 2),
             "volatility": round(safe_float(vol_score, 15.0), 1),
-            "source": "Yahoo Finance (Real-Time)"
+            "fundamentals_available": fundamentals_available,
+            "source": "Yahoo Finance"
         }
         
     except Exception as e:
-        logger.error(f"Error fetching real data for {resolved_symbol}: {str(e)}. Falling back to mock data.")
-        return get_mock_stock_data(resolved_symbol)
+        if mock_data_allowed():
+            logger.error(f"Error fetching real data for {resolved_symbol}: {str(e)}. ALLOW_MOCK_DATA is on; using mock data.")
+            return get_mock_stock_data(resolved_symbol)
+        logger.error(f"Error fetching real data for {resolved_symbol}: {str(e)}")
+        raise MarketDataUnavailable(f"No market data for {resolved_symbol}") from e
 
 def get_mock_stock_data(symbol: str) -> dict:
     """Generates realistic mock data as a robust fallback."""
@@ -301,6 +328,7 @@ def get_mock_stock_data(symbol: str) -> dict:
         "support": round(price * 0.92, 2),
         "resistance": round(price * 1.05, 2),
         "volatility": round(random.uniform(10, 40), 1),
+        "fundamentals_available": True,
         "source": "Mock Data Engine (Fallback)"
     }
 
@@ -359,17 +387,23 @@ def get_multiple_timeframes(symbol: str) -> dict:
             hist_1w = hist_1w.dropna(subset=['Close'])
             timeframes["1w"] = hist_1w['Close'].round(2).tolist()
             
-        # Standardize fallback keys if any timeframe is missing
-        base_price = get_stock_data(resolved_symbol)["price"]
-        for tf, period_days in [("15m", 5), ("1h", 20), ("4h", 40), ("1d", 60), ("1w", 52)]:
-            if tf not in timeframes or len(timeframes[tf]) == 0:
-                timeframes[tf] = simulate_history(base_price, period_days)
-                
+        # A timeframe with no real data stays empty; the technical agent reports it
+        # as Neutral. Simulated prices are only filled in for offline development.
+        missing = [tf for tf in ("15m", "1h", "4h", "1d", "1w") if not timeframes.get(tf)]
+        if missing and mock_data_allowed():
+            base_price = get_stock_data(resolved_symbol)["price"]
+            for tf in missing:
+                timeframes[tf] = simulate_history(base_price, 50)
+        for tf in missing:
+            timeframes.setdefault(tf, [])
+
         return timeframes
         
     except Exception as e:
         logger.error(f"Error fetching historical timeframes for {resolved_symbol}: {str(e)}")
-        # Complete fallback
+        if not mock_data_allowed():
+            return {tf: [] for tf in ("15m", "1h", "4h", "1d", "1w")}
+        # Complete fallback (offline development only)
         base_price = 100.0
         try:
             base_price = get_stock_data(resolved_symbol)["price"]
@@ -407,15 +441,12 @@ def is_ticker_valid(symbol: str) -> bool:
         # Test basic initialization (triggers ValueErrors on bad formatting e.g. ISIN check)
         ticker = yf.Ticker(resolved, session=_yf_session)
         
-        # Fetch 1-day history to check existence
-        hist = ticker.history(period="1d")
+        # A real, listed ticker always has price history for the last five sessions.
+        # Yahoo answers an unknown symbol with an empty frame rather than an error.
+        hist = ticker.history(period="5d")
         if hist.empty:
-            # Check if there is any basic symbol data or if it's completely missing
-            info = ticker.info
-            # If info is empty or missing key metrics, it's invalid
-            if not info or not any(k in info for k in ["regularMarketPrice", "longName", "symbol"]):
-                logger.warning(f"Ticker validation: Ticker {resolved} returned empty history and info.")
-                return False
+            logger.warning(f"Ticker validation: {resolved} returned no price history.")
+            return False
         return True
     except ValueError as ve:
         # e.g., ValueError: Invalid ISIN number: FAKESTOCK123

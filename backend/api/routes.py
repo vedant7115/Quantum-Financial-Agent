@@ -5,7 +5,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from models.schemas import AnalyzeRequest, AnalyzeResponse
 from agents import technical_agent, fundamental_agent, sentiment_agent, master_agent
-from services import stock_service, news_service, cache_service
+from services import stock_service, news_service, cache_service, billing_service
 import logging
 import os
 from dotenv import load_dotenv
@@ -91,8 +91,9 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     analysis flow, aggregates signals through the Master Agent, and returns the analysis.
     """
     # ── Step 0a: Rate Limiting Safety Check ──
-    client_ip = req.client.host if req.client else "127.0.0.1"
-    if is_rate_limited(client_ip, limit=10, window=60):
+    access = billing_service.resolve_access(req)
+    client_ip = billing_service.client_ip(req)
+    if is_rate_limited(access["client_id"], limit=10, window=60):
         logger.warning(f"Rate limit exceeded for client IP: {client_ip}")
         raise HTTPException(
             status_code=429,
@@ -109,6 +110,21 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     if not is_valid_symbol_format(symbol):
         logger.warning(f"Invalid stock ticker symbol format: {symbol}")
         raise HTTPException(status_code=400, detail="INVALID_TICKER")
+
+    # ── Step 0b2: Plan quota ──
+    # Checked against the resolved symbol so "RELIANCE" and "RELIANCE.NS" count once.
+    quota_symbol = stock_service.resolve_symbol(symbol)
+    if not billing_service.can_analyze(access, quota_symbol):
+        logger.info(f"Daily quota reached for {access['client_id']} on plan {access['plan']['id']}")
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "QUOTA_EXCEEDED", **billing_service.access_summary(access)},
+        )
+
+    def deliver(report: dict) -> dict:
+        """Counts the report against the caller's quota and applies plan locks."""
+        billing_service.record_analysis(access, quota_symbol)
+        return billing_service.apply_entitlements(report, access)
 
     # ── Step 0c: Demo Mode Check ──
     if DEMO_MODE and symbol in DEMO_REPORTS:
@@ -129,7 +145,7 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         if "system_status" in demo_report:
             demo_report["system_status"]["execution_time_sec"] = 0.3
             demo_report["system_status"]["cache_status"] = "Demo Hit"
-        return demo_report
+        return deliver(demo_report)
 
     # ── Step 0d: Live Ticker Existence Check ──
     # Check if symbol actually exists on yfinance before doing expensive queries
@@ -147,11 +163,11 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     logger.info(f"Received analysis request for symbol: {symbol}")
     
     # ── Step 1: Check Cache ──
-    cached_result = cache_service.get_from_cache(symbol)
+    cached_result = cache_service.get_from_cache(quota_symbol)
     if cached_result:
         logger.info(f"Returning cached analysis for symbol: {symbol}")
         try:
-            cache_info = cache_service.get_cache_info(symbol)
+            cache_info = cache_service.get_cache_info(quota_symbol)
             fallback_active = cached_result.get("final_decision", {}).get("fallback_active", False)
             cached_result["system_status"] = {
                 "backend_status": "Online",
@@ -169,7 +185,7 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
                 {"timestamp": time.strftime("%H:%M:%S", time.localtime(time.time())), "event": "Cached Report Retrieved"},
                 {"timestamp": time.strftime("%H:%M:%S", time.localtime(time.time())), "event": "Report Dispatched"}
             ]
-            return cached_result
+            return deliver(cached_result)
         except Exception as cache_err:
             logger.warning(f"Cached schema mismatch for {symbol}. Recalculating. Error: {str(cache_err)}")
             cache_service.clear_cache()
@@ -187,6 +203,9 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         add_to_timeline("Market Data Ingested")
         logger.info(f"Successfully retrieved data. Executing analysis pipeline...")
         
+    except stock_service.MarketDataUnavailable as data_err:
+        logger.error(f"Market data unavailable for {symbol}: {str(data_err)}")
+        raise HTTPException(status_code=502, detail="DATA_UNAVAILABLE")
     except Exception as data_err:
         logger.error(f"Data acquisition failure for {symbol}: {str(data_err)}")
         raise HTTPException(
@@ -247,7 +266,7 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         "yfinance_status": "Online",
         "news_status": "Online",
         "cache_status": "Miss",
-        "cache_ttl_sec": 300,
+        "cache_ttl_sec": cache_service.CACHE_TTL,
         "execution_time_sec": exec_time
     }
 
@@ -272,8 +291,20 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     # Store in cache
     cache_service.set_in_cache(resolved_symbol, response_data)
     logger.info(f"Completed analysis and cached response for {resolved_symbol}")
-    
-    return response_data
+
+    return deliver(response_data)
+
+
+@router.get("/plans")
+async def list_plans():
+    """GET /plans — the plans and prices shown on the pricing page."""
+    return {"plans": billing_service.public_plans()}
+
+
+@router.get("/usage")
+async def get_usage(req: Request):
+    """GET /usage — the caller's plan, locked sections and reports left today."""
+    return billing_service.access_summary(billing_service.resolve_access(req))
 
 
 @router.get("/health")
@@ -307,6 +338,8 @@ async def get_stock_info(symbol: str):
             "stock": stock_data,
             "timeframes": timeframe_data
         })
+    except stock_service.MarketDataUnavailable:
+        raise HTTPException(status_code=502, detail="DATA_UNAVAILABLE")
     except Exception as e:
         logger.error(f"Error fetching stock info for {resolved_symbol}: {str(e)}")
         raise HTTPException(
@@ -357,12 +390,15 @@ async def get_live_price(symbol: str):
 
 
 @router.post("/clear-cache")
-async def clear_analysis_cache():
+async def clear_analysis_cache(req: Request):
     """
     POST /clear-cache
     Flushes all in-memory cached analysis results. Use between demo runs
     to ensure fresh data without restarting the server.
     """
+    admin_token = os.getenv("ADMIN_TOKEN", "").strip()
+    if not admin_token or req.headers.get("x-admin-token", "") != admin_token:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
     cache_service.clear_cache()
     logger.info("Cache cleared via admin endpoint.")
     return {"status": "ok", "message": "Analysis cache cleared. Next requests will fetch fresh data."}
