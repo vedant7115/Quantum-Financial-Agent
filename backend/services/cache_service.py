@@ -10,7 +10,11 @@ import time
 _cache = {}
 
 # How long to keep a result before considering it stale (in seconds)
-CACHE_TTL = 60  # 1 minute — keeps prices fresh during demo
+import os
+
+# Daily closes and annual statements do not change minute to minute, so a report
+# is reused for 15 minutes by default. This is also the main lever on LLM cost.
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))
 
 
 def get_from_cache(key: str):

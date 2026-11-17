@@ -6,9 +6,9 @@ import "../styles/quantum-next.css";
 // Shown until the API answers (the backend may be waking up). Kept in step with
 // PLANS in backend/services/billing_service.py, which is the source of truth.
 const FALLBACK_PLANS = [
-  { id: "free", name: "Free", price_inr: 0, price_usd: 0, features: ["3 research reports a day", "Summary, technicals, fundamentals and news", "US and Indian stocks"] },
-  { id: "pro", name: "Pro", price_inr: 499, price_usd: 9, features: ["50 research reports a day", "Bull vs bear debate", "Risk register and catalyst calendar", "PDF export"] },
-  { id: "desk", name: "Desk", price_inr: 2999, price_usd: 39, features: ["500 research reports a day", "Everything in Pro", "Priority support"] },
+  { id: "free", name: "Free", price_inr: 0, price_usd: 0, features: ["3 research reports a day", "Overall view and 8-pillar scorecard", "Price, financials and news evidence", "US and Indian stocks"] },
+  { id: "plus", name: "Plus", price_inr: 149, price_usd: 1.99, features: ["15 research reports a day", "Everything in Free", "Historical base rates for the current trend", "Bull case and bear case"] },
+  { id: "pro", name: "Pro", price_inr: 499, price_usd: 5.99, features: ["60 research reports a day", "Everything in Plus", "Risk register", "What would change the view, with key dates", "PDF export"] },
 ];
 
 const FAQ = [
@@ -77,7 +77,7 @@ export default function PricingPage({ onStartResearch, onAccessChange }) {
           <p className="qx-eyebrow">Pricing</p>
           <h1 className="qx-title">Start free. Upgrade for the full picture.</h1>
           <p className="qx-lede">
-            Every plan runs the same research engine on the same data. Paid plans add depth and volume.
+            Every plan runs the same research engine on the same data. Paid plans add depth and more reports.
           </p>
 
           <div className="qx-seg" role="group" aria-label="Currency">
@@ -97,12 +97,12 @@ export default function PricingPage({ onStartResearch, onAccessChange }) {
 
         <div className="qx-plans">
           {plans.map((plan) => {
-            const featured = plan.id === "pro";
+            const featured = plan.id === "plus";
             const isCurrent = plan.id === currentPlan;
             const paid = plan.id !== "free";
             return (
               <section key={plan.id} className="qx-plan" data-featured={featured}>
-                {featured && <span className="qx-plan-tag">Recommended</span>}
+                {featured && <span className="qx-plan-tag">Start here</span>}
                 <h2 className="qx-plan-name">{plan.name}</h2>
                 <div className="qx-price">
                   <span className="qx-price-amount">{formatPrice(plan, currency)}</span>
@@ -148,7 +148,7 @@ export default function PricingPage({ onStartResearch, onAccessChange }) {
               type="text"
               value={keyInput}
               onChange={(e) => setKeyInput(e.target.value)}
-              placeholder="qk_pro_…"
+              placeholder="qk_plus_…"
               aria-label="Access key"
               autoComplete="off"
               spellCheck="false"

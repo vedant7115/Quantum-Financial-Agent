@@ -4,7 +4,7 @@ Usage (from the repository root, with ACCESS_KEY_SECRET set to the same value
 the backend uses):
 
     python scripts/issue_access_key.py pro 30
-    python scripts/issue_access_key.py desk 365
+    python scripts/issue_access_key.py plus 30
 """
 
 import os

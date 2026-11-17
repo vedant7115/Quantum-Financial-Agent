@@ -13,7 +13,9 @@ load_dotenv()
 logger = logging.getLogger("quantum_agent.llm_service")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+# The 120b model follows the JSON format and the evidence-only rules reliably;
+# the 20b model often fails JSON validation on this prompt, so it is only a fallback.
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 import re
 
@@ -55,7 +57,7 @@ def query_groq(prompt: str, system_prompt: str = None, response_json: bool = Tru
     primary_model = os.getenv("GROQ_MODEL", DEFAULT_MODEL).strip().strip("'\"")
     # Candidate models to try in sequence if one hits rate limits or errors
     candidate_models = [primary_model]
-    for fallback_m in ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]:
+    for fallback_m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
         if fallback_m not in candidate_models:
             candidate_models.append(fallback_m)
 

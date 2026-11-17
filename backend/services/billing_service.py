@@ -14,8 +14,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-# Section ids match the <section id="..."> values in InstitutionalReport.jsx.
-PREMIUM_SECTIONS = ["debate", "risks", "calendar"]
+# Section ids match the locked sections in frontend/src/components/ResearchReport.jsx.
+PREMIUM_SECTIONS = ["base_rates", "debate", "risks", "watch"]
 
 PLANS = {
     "free": {
@@ -28,37 +28,40 @@ PLANS = {
         "pdf_export": False,
         "features": [
             "3 research reports a day",
-            "Summary, technicals, fundamentals and news",
+            "Overall view and 8-pillar scorecard",
+            "Price, financials and news evidence",
             "US and Indian stocks",
+        ],
+    },
+    "plus": {
+        "id": "plus",
+        "name": "Plus",
+        "price_inr": 149,
+        "price_usd": 1.99,
+        "daily_reports": 15,
+        "locked_sections": ["risks", "watch"],
+        "pdf_export": False,
+        "features": [
+            "15 research reports a day",
+            "Everything in Free",
+            "Historical base rates for the current trend",
+            "Bull case and bear case",
         ],
     },
     "pro": {
         "id": "pro",
         "name": "Pro",
         "price_inr": 499,
-        "price_usd": 9,
-        "daily_reports": 50,
+        "price_usd": 5.99,
+        "daily_reports": 60,
         "locked_sections": [],
         "pdf_export": True,
         "features": [
-            "50 research reports a day",
-            "Bull vs bear debate",
-            "Risk register and catalyst calendar",
+            "60 research reports a day",
+            "Everything in Plus",
+            "Risk register",
+            "What would change the view, with key dates",
             "PDF export",
-        ],
-    },
-    "desk": {
-        "id": "desk",
-        "name": "Desk",
-        "price_inr": 2999,
-        "price_usd": 39,
-        "daily_reports": 500,
-        "locked_sections": [],
-        "pdf_export": True,
-        "features": [
-            "500 research reports a day",
-            "Everything in Pro",
-            "Priority support",
         ],
     },
 }
@@ -67,7 +70,12 @@ PLANS = {
 _SECTION_FIELDS = {
     "debate": ["bull_case", "bear_case"],
     "risks": ["risk_register"],
-    "calendar": ["catalyst_calendar"],
+    "watch": ["catalyst_calendar", "watchlist_factors"],
+}
+# Fields of the insight block that belong to each premium section.
+_INSIGHT_FIELDS = {
+    "base_rates": ["base_rates"],
+    "watch": ["watch", "calendar"],
 }
 
 _usage_lock = threading.Lock()
@@ -189,6 +197,9 @@ def apply_entitlements(report: dict, access: dict) -> dict:
     for section in access["plan"]["locked_sections"]:
         for field in _SECTION_FIELDS.get(section, []):
             decision[field] = []
+        for field in _INSIGHT_FIELDS.get(section, []):
+            if isinstance(gated.get("insight"), dict):
+                gated["insight"][field] = None
     gated["access"] = access_summary(access)
     return gated
 

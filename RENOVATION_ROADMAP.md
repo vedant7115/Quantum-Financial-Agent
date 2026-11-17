@@ -112,28 +112,74 @@ client-ready PDFs.
 Free users get the conclusion. Paying users get the reasoning, the history, and the
 alerts. The paywall should sit on depth and convenience, never on correctness.
 
-| | **Free** | **Pro** | **Desk** |
+| | **Free** | **Plus** | **Pro** |
 | :-- | :-- | :-- | :-- |
-| Price | ₹0 | ₹499 / month (US$9) | ₹2,999 / month (US$39) |
-| Reports per day | 3 | 50 | 500 |
-| Summary, technicals, fundamentals, news | Yes | Yes | Yes |
-| Bull vs bear debate | Locked | Yes | Yes |
-| Risk register and catalyst calendar | Locked | Yes | Yes |
-| PDF export | Locked | Yes | Yes, white-label (to build) |
-| Watchlist and saved reports | — | To build | To build |
-| Price and news alerts | — | To build | To build |
-| API access | — | — | To build |
+| Price | ₹0 | ₹149 / month (US$1.99) | ₹499 / month (US$5.99) |
+| Reports per day | 3 | 15 | 60 |
+| Overall view, 8-pillar scorecard, evidence, financials, news | Yes | Yes | Yes |
+| Historical base rates for the current trend | Locked | Yes | Yes |
+| Bull case and bear case | Locked | Yes | Yes |
+| Risk register | Locked | Locked | Yes |
+| What would change the view, with key dates | Locked | Locked | Yes |
+| PDF export | Locked | Locked | Yes |
+| Watchlist, saved reports, alerts | — | To build | To build |
 
-Annual billing at two months free. Prices are starting points to test, not findings;
-they are set in one place (`backend/services/billing_service.py`).
+Nothing is priced above ₹499. Annual billing at two months free (₹1,490 and ₹4,990).
+Prices live in one place: `backend/services/billing_service.py`.
 
-### Unit economics (rough)
+### Budget plan (cheapest workable setup)
 
-A report costs one Groq call (a few thousand tokens) plus data. I have not priced
-this against Groq's current rate card; do that before fixing prices, and again if the
-sub-agent LLM calls are switched on (four calls per report instead of one). Inference
-for a model of this size is normally a small fraction of a ₹499 subscription even for
-a heavy user. The cost line to watch is the market-data licence, not the model.
+Figures marked * come from third-party pricing pages read in November 2026, not from
+the vendor's own page. Check each one before relying on it. Rupee figures assume
+roughly ₹88 to the dollar.
+
+**Fixed cost each month**
+
+| Item | Cheap choice | Cost | Note |
+| :-- | :-- | :-- | :-- |
+| Backend hosting | Render Starter, 512 MB | US$7* (about ₹620) | The free tier sleeps after 15 idle minutes and takes up to a minute to wake. Fine for testing, not for people who paid. |
+| Frontend hosting | Cloudflare Pages or a Render static site | ₹0 (verify terms) | Vercel's Hobby plan is for non-commercial use only, by Vercel's own fair-use rules. Charging money on it breaks them. Moving a static Vite build is a small job. |
+| Database and login | Supabase free tier | ₹0 (verify limits) | Needed for accounts, usage counts and saved reports. |
+| Domain | .in or .com | about ₹80 (₹900 a year) | |
+| AI model | Groq, `openai/gpt-oss-120b` | pay per use, below | Free tier reported at 200K tokens a day* on this model, roughly 70 fresh reports. Enough to launch. |
+| Market data | Yahoo Finance via yfinance | ₹0 | Not licensed for commercial use. This is the largest open risk, see below. |
+| **Total** | | **about ₹700 a month** | |
+
+**Cost of one report**
+
+One model call: about 1,500 tokens in and up to 1,200 out. At US$0.15 and US$0.60 per
+million tokens* that is about US$0.001, or **9 paise**. Reports are cached for 15
+minutes (`CACHE_TTL_SECONDS`), so a popular stock is paid for once and served to
+everyone who asks in that window.
+
+**What a subscriber leaves after costs**
+
+| | Plus ₹149 | Pro ₹499 |
+| :-- | :-- | :-- |
+| Payment gateway, 2% plus 18% GST on the fee* | ₹3.50 | ₹11.80 |
+| Subscription add-on, about 1%* | ₹1.50 | ₹5.00 |
+| Model cost, typical use (5 and 20 reports a day) | ₹13 | ₹54 |
+| Model cost, worst case (every report, every day) | ₹40 | ₹160 |
+| **Left, typical** | **about ₹130** | **about ₹430** |
+| **Left, worst case** | about ₹104 | about ₹322 |
+
+Break-even on the ₹700 fixed cost is **about 6 Plus subscribers or 2 Pro**. Even the
+heaviest possible user stays profitable, so the daily limits are safe as set.
+
+**Things that change these numbers**
+
+- GST: 18% is due on your sales once you must register (check the threshold with a CA).
+  The pricing page already says prices exclude taxes.
+- Licensed market data. When Yahoo has to be replaced, expect the data bill to become
+  the largest cost. Price it before growth, not after.
+- UPI AutoPay for recurring billing has its own per-debit pricing that Razorpay does
+  not publish as a flat rate.
+
+**Order to spend money in**
+
+1. ₹0: launch on the free tiers to a small group, with keys issued by hand.
+2. About ₹700 a month: Render Starter and a domain, when the first person pays.
+3. Later, only when revenue covers it: licensed data, then a larger backend instance.
 
 ### Other revenue, in order of how soon it is realistic
 
@@ -240,7 +286,8 @@ See the commit diff for detail. Environment variables introduced:
 
 | Variable | Where | Purpose |
 | :-- | :-- | :-- |
-| `ACCESS_KEY_SECRET` | backend | Signs Pro/Desk access keys. Without it only the Free plan exists. |
+| `ACCESS_KEY_SECRET` | backend | Signs Plus/Pro access keys. Without it only the Free plan exists. |
+| `CACHE_TTL_SECONDS` | backend | How long a report is reused (default 900). The main lever on model cost. |
 | `ADMIN_TOKEN` | backend | Required header value for `/api/clear-cache`. |
 | `ALLOW_MOCK_DATA` | backend | `true` re-enables mock data for offline development only. |
 | `FREE_DAILY_REPORTS` | backend | Overrides the free quota (default 3). |
@@ -249,9 +296,52 @@ See the commit diff for detail. Environment variables introduced:
 Issue a key for a paying customer:
 
 ```bash
+python scripts/issue_access_key.py plus 30
 python scripts/issue_access_key.py pro 30
 ```
 
 Known limits of this foundation: usage counters are in memory (reset on restart) and
 free users are identified by IP address. Both are replaced by accounts and a database
 in Phase 1.
+
+## 7. Second pass: evidence engine and redesign
+
+**The model.** Analysis no longer depends on what the language model says.
+`backend/services/research_engine.py` calculates everything from five years of daily
+prices, the market benchmark and the company's reported statements:
+
+- Eight pillars scored 0 to 100: trend, momentum, stability, profitability, growth,
+  valuation, balance sheet, news flow. Up to 28 checks, each with a fixed threshold.
+- Every check records a finding that states its number and why it matters.
+- Fundamentals come from the financial statements (revenue, margins, return on
+  equity, free cash flow, debt, interest cover) instead of the summary endpoint that
+  Render could not reach. Banks are handled separately: debt tests are not applied.
+- Historical base rates: what this stock did over the next three months from every
+  past day in the same trend state, with the count of separate stretches shown.
+- Confidence now measures the evidence (data coverage, agreement between pillars,
+  distance from neutral), not the model's mood.
+- The language model writes the summary, the two cases and the risk notes from the
+  findings only. Its answer is rejected, and a rule-written version used, if it
+  contains advice wording or numbers that are not in the evidence.
+- Earnings dates come from the exchange calendar. The model is no longer asked for dates.
+- Headlines: filing-notice spam and price-page links are filtered out, headlines must
+  name the company, and the tone lexicon handles upgrades, downgrades and target cuts.
+
+**The interface.** New shell, home page and report in the "calm, exact" language
+(`frontend/src/App.jsx`, `components/HomePage.jsx`, `components/ResearchReport.jsx`,
+`styles/quantum-app.css`). Reports have shareable links (`#/s/AAPL`). Every section
+shows calculated data; the browser-invented sections are gone with the old report.
+
+**Known limits**
+
+- Whether statement data loads on Render is not yet verified. It works locally. Each
+  report states its coverage, so the first deploy will show it. If it is blocked, the
+  free fallbacks are SEC EDGAR for US companies (official, no key) and a paid feed for India.
+- Valuation is judged on absolute levels, not against sector peers.
+- Foreign listings that report in another currency are only detected when the
+  provider returns the reporting currency.
+- Yahoo sometimes carries figures that differ from the company's filings.
+- The old screens (`LandingPage.jsx`, `InstitutionalReport.jsx`, `ArchitecturePage.jsx`
+  and their helpers) are no longer imported. They are still in the repo and can be
+  deleted once the team agrees.
+

@@ -233,6 +233,12 @@ def get_stock_data(symbol: str) -> dict:
             info.get(k) is not None
             for k in ("trailingPE", "forwardPE", "totalRevenue", "netIncomeToCommon", "revenueGrowth")
         )
+        currency = info.get("currency")
+        if not currency:
+            try:
+                currency = getattr(ticker.fast_info, "currency", None)
+            except Exception:
+                currency = None
         if market_cap_raw:
             if market_cap_raw >= 1e12:
                 market_cap = f"${market_cap_raw / 1e12:.2f}T"
@@ -289,6 +295,11 @@ def get_stock_data(symbol: str) -> dict:
             "resistance": round(safe_float(resistance, last_price), 2),
             "volatility": round(safe_float(vol_score, 15.0), 1),
             "fundamentals_available": fundamentals_available,
+            "market_cap_raw": safe_float(market_cap_raw, 0.0) or None,
+            "currency": currency,
+            "financial_currency": info.get("financialCurrency"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
             "source": "Yahoo Finance"
         }
         

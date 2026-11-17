@@ -5,7 +5,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from models.schemas import AnalyzeRequest, AnalyzeResponse
 from agents import technical_agent, fundamental_agent, sentiment_agent, master_agent
-from services import stock_service, news_service, cache_service, billing_service
+from services import stock_service, news_service, cache_service, billing_service, research_engine
 import logging
 import os
 from dotenv import load_dotenv
@@ -197,8 +197,9 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         
         # Sequentially fetch datasets
         stock_data = stock_service.get_stock_data(resolved_symbol)
-        timeframe_data = stock_service.get_multiple_timeframes(resolved_symbol)
-        news_data = news_service.get_news(resolved_symbol)
+        news_data = news_service.get_news(resolved_symbol, stock_data.get("name", ""))
+        # Evidence pass: five years of prices, the benchmark and reported statements.
+        research = research_engine.build(resolved_symbol, stock_data, news_data.get("articles", []))
         
         add_to_timeline("Market Data Ingested")
         logger.info(f"Successfully retrieved data. Executing analysis pipeline...")
@@ -217,12 +218,12 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     try:
         # Technical Agent (assesses multi-timeframe closes)
         logger.info(f"Running Technical Analysis Agent for {resolved_symbol}...")
-        technical_result = technical_agent.analyze(stock_data, timeframe_data)
+        technical_result = technical_agent.analyze(stock_data, research)
         add_to_timeline("Technical Intel Generated")
         
         # Fundamental Agent (assesses earnings, margins, valuation)
         logger.info(f"Running Fundamental Analysis Agent for {resolved_symbol}...")
-        fundamental_result = fundamental_agent.analyze(stock_data)
+        fundamental_result = fundamental_agent.analyze(stock_data, research)
         add_to_timeline("Fundamental Intel Generated")
         
         # Sentiment Agent (assesses recent news headlines)
@@ -243,7 +244,8 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         final_decision = master_agent.analyze(
             technical_result, 
             fundamental_result, 
-            sentiment_result
+            sentiment_result,
+            research
         )
         add_to_timeline("Consensus Aggregated")
     except Exception as master_err:
@@ -282,7 +284,8 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         "sentiment": sentiment_result,
         "final_decision": final_decision,
         "system_status": system_status,
-        "timeline": timeline
+        "timeline": timeline,
+        "insight": research
     }
     
     # Sanitize all NaN/Inf floats before caching and returning

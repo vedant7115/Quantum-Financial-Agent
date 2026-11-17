@@ -19,6 +19,7 @@ class TechnicalResult(BaseModel):
     """Output from the Technical Analysis Agent (combines code indicator math and LLM output)"""
     trend: str                      # "Bullish", "Bearish", "Neutral"
     confidence: int                 # 0–100 score
+    score: Optional[float] = None   # 0-100 technical score (trend and momentum)
     reason: str                     # Backward compatibility fallback
     summary: str                    # Detailed trend & structure commentary
     trend_strength: str             # "Strong", "Moderate", "Weak"
@@ -53,6 +54,7 @@ class FundamentalResult(BaseModel):
     metrics: Dict[str, Any]         # Dictionary of raw data metrics
     fallback_active: bool = False   # True if fallback engine was activated
     data_available: bool = True     # False when company financials could not be fetched
+    score: Optional[float] = None   # 0-100 fundamental score
     growth_outlook: str = ""        # V2 field
     valuation_outlook: str = ""    # V2 field
     ai_commentary: str = ""         # V2 field
@@ -121,4 +123,5 @@ class AnalyzeResponse(BaseModel):
     system_status: SystemStatus = None # System performance & fallback statistics
     timeline: List[Dict[str, Any]] = [] # Stage execution timeline logs
     access: Optional[Dict[str, Any]] = None # Caller's plan, locked sections and usage
+    insight: Optional[Dict[str, Any]] = None # Calculated evidence: scorecard, findings, base rates, chart
 
