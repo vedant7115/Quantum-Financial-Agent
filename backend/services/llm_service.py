@@ -18,7 +18,8 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 # The 120b model follows the JSON format and the evidence-only rules reliably;
 # the 20b model often fails JSON validation on this prompt, so it is only a fallback.
 DEFAULT_MODEL = "openai/gpt-oss-120b"
-FALLBACK_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
+# Order matters: qwen is last because its free tier allows only 1,000 output tokens a minute (about one brief).
+FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 # Ceiling on the answer, so one report can never use up a whole minute's allowance.
 MAX_OUTPUT_TOKENS = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1600"))
 
