@@ -18,7 +18,7 @@ load_dotenv()
 app = FastAPI(
     title="QUANTUM AGENT API",
     description="Multi-Agent Financial Intelligence Platform — Technical, Fundamental & Sentiment Analysis",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # ── CORS (Cross-Origin Resource Sharing) ──────────────────────────────────────
@@ -57,7 +57,7 @@ async def root():
     return {
         "name": "QUANTUM AGENT API",
         "status": "online",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "docs": "/docs",
         "endpoints": {
             "analyze": "POST /api/analyze",

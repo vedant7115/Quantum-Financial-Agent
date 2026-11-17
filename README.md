@@ -3,6 +3,8 @@
 
 QUANTUM is an advanced, production-ready multi-agent investment research and decision-support system. It orchestrates parallel AI agent nodes to process real-time market data, financial statements, and news headlines, delivering a unified Market Bias synthesis report.
 
+> **Version 2.0.0** rebuilds the research engine, the design and the plans. See [CHANGELOG.md](CHANGELOG.md) for everything that changed.
+
 ---
 
 ## 🚀 Architectural Capabilities
