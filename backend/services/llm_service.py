@@ -1,6 +1,8 @@
 # llm_service.py
 # Reusable service for communicating with the Groq API.
-# Utilizes llama-3.3-70b-versatile as the reasoning backbone.
+# Each report makes ONE call (the written brief), about 2,000 to 3,000 tokens.
+# Groq's free tier allows 8,000 tokens a minute per model, so the models below are
+# tried in turn: each has its own allowance, and a rate-limited model is skipped at once.
 # Configures strict timeouts and raises exceptions on failure to allow rule fallbacks.
 
 import os
@@ -16,6 +18,9 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 # The 120b model follows the JSON format and the evidence-only rules reliably;
 # the 20b model often fails JSON validation on this prompt, so it is only a fallback.
 DEFAULT_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
+# Ceiling on the answer, so one report can never use up a whole minute's allowance.
+MAX_OUTPUT_TOKENS = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1600"))
 
 import re
 
@@ -57,7 +62,7 @@ def query_groq(prompt: str, system_prompt: str = None, response_json: bool = Tru
     primary_model = os.getenv("GROQ_MODEL", DEFAULT_MODEL).strip().strip("'\"")
     # Candidate models to try in sequence if one hits rate limits or errors
     candidate_models = [primary_model]
-    for fallback_m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+    for fallback_m in FALLBACK_MODELS:
         if fallback_m not in candidate_models:
             candidate_models.append(fallback_m)
 
@@ -67,8 +72,12 @@ def query_groq(prompt: str, system_prompt: str = None, response_json: bool = Tru
         payload = {
             "model": model_name,
             "messages": messages,
-            "temperature": 0.1
+            "temperature": 0.1,
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
         }
+        if model_name.startswith("openai/gpt-oss"):
+            # The scores are already calculated; the model only writes, so little hidden reasoning is needed.
+            payload["reasoning_effort"] = "low"
         if response_json:
             payload["response_format"] = {"type": "json_object"}
 
