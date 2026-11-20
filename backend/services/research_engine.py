@@ -621,15 +621,18 @@ def _weighted(parts):
 # score sits near the middle for a reason that a single number hides. Such reports
 # are flagged and their confidence is capped.
 CONFLICT_CONFIDENCE_CAP = 60
+CONFLICT_MIN_GAP = 15
 
 
 def assess_conflict(technical_score, fundamental_score):
-    """(conflicted, note). Conflicted when both scores exist and fall on opposite
-    sides of 50; a score of exactly 50 is on neither side."""
+    """(conflicted, note). Conflicted when both scores exist, fall on opposite sides
+    of 50 (exactly 50 is on neither side) and are more than CONFLICT_MIN_GAP points
+    apart, so 52 against 48 is not treated as a conflict."""
     if technical_score is None or fundamental_score is None:
         return False, ""
     t, f = float(technical_score), float(fundamental_score)
-    if (t > 50 and f < 50) or (t < 50 and f > 50):
+    opposite = (t > 50 and f < 50) or (t < 50 and f > 50)
+    if opposite and abs(t - f) > CONFLICT_MIN_GAP:
         price_side, business_side = ("positive", "negative") if t > 50 else ("negative", "positive")
         return True, (f"Price evidence is {price_side} ({t:.0f}/100) while the business evidence is "
                       f"{business_side} ({f:.0f}/100); confidence is capped at {CONFLICT_CONFIDENCE_CAP}%.")
@@ -758,6 +761,11 @@ def assemble(symbol: str, stock_data: dict, close: pd.Series, price: tuple, fund
         "composite": int(round(composite)), "technical_score": _r(technical_score, 0), "fundamental_score": _r(fundamental_score, 0),
         "bias": bias, "confidence": confidence, "risk": risk,
         "conflicted": conflicted, "conflict_note": conflict_note,
+        "conflict": ({"label": "Mixed signals", "technical_score": _r(technical_score, 0),
+                      "fundamental_score": _r(fundamental_score, 0),
+                      "gap": _r(abs(technical_score - fundamental_score), 0),
+                      "confidence_cap": CONFLICT_CONFIDENCE_CAP, "note": conflict_note}
+                     if conflicted else None),
         "scorecard": scorecard,
         "findings": [{k: v for k, v in f.items() if k != "weight"} for f in findings],
         "strengths": [{k: v for k, v in f.items() if k != "weight"} for f in strengths[:5]],

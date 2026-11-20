@@ -81,6 +81,8 @@ def test_conflict_rule_and_confidence_cap(monkeypatch, uptrend):
     assert engine.assess_conflict(30, 70)[0] is True
     assert engine.assess_conflict(70, 55)[0] is False
     assert engine.assess_conflict(50, 30)[0] is False   # 50 is on neither side
+    assert engine.assess_conflict(58, 44)[0] is False   # opposite sides, but only 14 apart
+    assert engine.assess_conflict(58, 42)[0] is True    # 16 apart
     assert engine.assess_conflict(70, None)[0] is False
 
     # Strong price trend with deliberately weak fundamentals -> conflicted, capped.
@@ -97,3 +99,16 @@ def test_conflict_rule_and_confidence_cap(monkeypatch, uptrend):
     assert report["conflicted"] is True
     assert report["confidence"] <= engine.CONFLICT_CONFIDENCE_CAP
     assert "capped" in report["conflict_note"]
+    conflict = report["conflict"]
+    assert conflict["label"] == "Mixed signals" and conflict["gap"] > engine.CONFLICT_MIN_GAP
+    assert conflict["technical_score"] > 50 > conflict["fundamental_score"]
+
+    # The rule-written brief says "Mixed signals" too.
+    from agents import master_agent
+    view = master_agent._rule_view(report, {"positive_drivers": [], "negative_drivers": []})
+    assert "Mixed signals:" in view["summary"]
+
+    # A report without a conflict carries conflict = None.
+    monkeypatch.undo()
+    calm = _offline_build(monkeypatch, uptrend)
+    assert calm["conflict"] is None and calm["conflicted"] is False
