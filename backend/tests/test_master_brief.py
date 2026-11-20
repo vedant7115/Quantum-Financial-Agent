@@ -1,10 +1,12 @@
 """LLM output validation and the one-retry rule. Groq is never called: the client is replaced."""
 
+import asyncio
 import json
 
 import pytest
 from pydantic import ValidationError
 
+import prompts
 from agents import master_agent
 from conftest import make_prices
 from services import research_engine as engine
@@ -54,29 +56,17 @@ def research(monkeypatch):
     return engine.build("TEST", {"name": "Test Co", "price": 300.0, "currency": "USD"}, articles=[])
 
 
-def _fake_groq(answers, calls):
-    def fake(prompt, request_id="-", **kwargs):
-        calls.append(prompt)
-        content = answers[len(calls) - 1]
-        return {"content": content, "model": "fake-model",
-                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
-                "attempts": [{"model": "fake-model", "status": 200}]}
-    return fake
-
-
-def test_retry_once_then_fall_back_to_rules(monkeypatch, research):
-    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+def test_retry_once_then_fall_back_to_rules(groq, research):
     sentiment = {"positive_drivers": [], "negative_drivers": []}
 
-    # Invalid twice -> rule-written brief, both attempts' tokens counted.
-    calls = []
-    monkeypatch.setattr(master_agent, "query_groq_with_meta", _fake_groq(["not json", '{"summary": "x"}'], calls))
-    out = master_agent.analyze({}, {}, sentiment, research, request_id="t1")
-    assert len(calls) == 2
-    assert "previous answer was rejected" in calls[1]
+    # Invalid twice -> rule-written brief; both calls' tokens are counted.
+    groq.answers = ["not json", '{"summary": "x"}']
+    out = asyncio.run(master_agent.analyze({}, {}, sentiment, research))
+    assert len(groq.prompts) == 2
+    assert "previous answer was rejected" in groq.prompts[1]
     assert out["fallback_active"] is True and out["llm"]["outcome"] == "rule"
-    assert out["llm"]["usage"]["total_tokens"] == 300
-    assert out["llm"]["prompt_version"] == master_agent.PROMPT_VERSION
+    assert out["llm"]["tokens"]["total"] == 2 * groq.TOTAL_TOKENS
+    assert out["llm"]["prompt_version"] == prompts.active_version()
 
     # Invalid then valid -> accepted on the retry. Built from the real evidence so the number check passes.
     evidence = master_agent._evidence_text(research, sentiment)
@@ -89,9 +79,8 @@ def test_retry_once_then_fall_back_to_rules(monkeypatch, research):
                  risk_register=[{"category": "Market risk", "severity": "Low", "probability": "Low",
                                  "explanation": "The price trend has been steady."}])
     assert master_agent.check_brief(json.dumps(valid), evidence)
-    calls = []
-    monkeypatch.setattr(master_agent, "query_groq_with_meta", _fake_groq(["{}", json.dumps(valid)], calls))
-    out = master_agent.analyze({}, {}, sentiment, research, request_id="t2")
+    groq.reset(answers=["{}", json.dumps(valid)])
+    out = asyncio.run(master_agent.analyze({}, {}, sentiment, research))
     assert out["llm"]["outcome"] == "ai_after_retry"
     assert out["fallback_active"] is False
     assert out["summary"].startswith("The evidence scores")

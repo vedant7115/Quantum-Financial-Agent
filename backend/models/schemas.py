@@ -125,5 +125,7 @@ class AnalyzeResponse(BaseModel):
     timeline: List[Dict[str, Any]] = [] # Stage execution timeline logs
     access: Optional[Dict[str, Any]] = None # Caller's plan, locked sections and usage
     insight: Optional[Dict[str, Any]] = None # Calculated evidence: scorecard, findings, base rates, chart
-    meta: Optional[Dict[str, Any]] = None    # request_id, prompt_version, model, token usage, brief outcome
+    meta: Optional[Dict[str, Any]] = None    # request_id, prompt_version, cache source, generating request
+    llm: Optional[Dict[str, Any]] = None     # model, prompt_version, tokens, latency_ms, fallback_used, attempts
+    trace: Optional[Dict[str, Any]] = None   # request_id and timed spans for this request
 

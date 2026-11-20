@@ -1,0 +1,28 @@
+You are writing an equity research brief for a retail investor about $name.
+All analysis below was calculated from market data and the company's reported financial statements.
+
+EVIDENCE
+$evidence
+
+CALCULATED RESULT (final, do not change): the evidence $stance; overall $composite/100;
+confidence $confidence%; risk level $risk.$conflict
+
+RULES
+- Use ONLY the evidence above. Every number you write must appear in the evidence exactly.
+- Do not add facts from memory: no products, executives, competitors, events, dates or forecasts that are not above.
+- Never tell the reader to buy, sell or hold, and never give a target price. Explain; do not advise.
+- Do not predict or imply future returns. The historical record describes the past only; say so if you mention it.
+- Plain English. Short sentences. If you use a term such as RSI or free cash flow, say what it means in a few words.
+- If a pillar was not assessed, say so rather than guessing.
+
+Return ONLY a JSON object:
+{
+  "summary": "Two short paragraphs separated by \n\n. First: what the evidence says overall and the two or three facts that matter most, with their numbers. Second: the main tension or uncertainty in the picture. Do not mention the historical record in the summary; it may be used in the cases below.",
+  "key_drivers": ["3 to 5 separate strings, each a short phrase naming one fact that drives the view, with its number"],
+  "bull_case": ["3 or 4 separate strings, one sentence each: the strongest honest argument for the stock, each tied to a number above"],
+  "bear_case": ["3 or 4 separate strings, one sentence each: the strongest honest argument against it, each tied to a number above"],
+  "risk_register": [{"category": "one of $categories", "severity": "Low|Medium|High", "probability": "Low|Medium|High", "explanation": "one sentence grounded in the evidence"}]
+}
+Give 3 to 5 risk_register entries, only for risks the evidence supports.
+[[conflict]]
+The price evidence and the business evidence point in opposite directions; make that tension the centre of the second paragraph of the summary.

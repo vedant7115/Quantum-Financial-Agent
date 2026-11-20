@@ -3,6 +3,7 @@
 # and tags each one positive / negative / neutral from its wording.
 # If nothing is found the list is empty. Headlines are never invented.
 
+import asyncio
 import datetime
 import logging
 import os
@@ -115,20 +116,15 @@ def _from_yahoo(symbol: str) -> list:
     return articles
 
 
-def fetch_rss_news(symbol: str, company_name: str = "") -> list:
-    """Google News RSS search for the company."""
+def _rss_url(symbol: str, company_name: str) -> str:
     india = symbol.endswith((".NS", ".BO"))
     term = company_name or symbol.split(".")[0]
     locale = "hl=en-IN&gl=IN&ceid=IN:en" if india else "hl=en-US&gl=US&ceid=US:en"
-    url = f"https://news.google.com/rss/search?q={quote_plus(term + ' stock')}+when:14d&{locale}"
-    try:
-        response = httpx.get(url, timeout=8.0, follow_redirects=True)
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-    except Exception as err:
-        logger.error(f"Google News RSS failed for {symbol}: {err}")
-        return []
+    return f"https://news.google.com/rss/search?q={quote_plus(term + ' stock')}+when:14d&{locale}"
 
+
+def _parse_rss(content: bytes) -> list:
+    root = ET.fromstring(content)
     articles = []
     for item in root.findall(".//item"):
         title = (item.findtext("title") or "").strip()
@@ -144,18 +140,32 @@ def fetch_rss_news(symbol: str, company_name: str = "") -> list:
     return articles
 
 
-def get_news(symbol: str, company_name: str = "") -> dict:
-    """Recent headlines for a symbol, newest first, de-duplicated."""
-    symbol = symbol.upper().strip()
-    articles, source_label = [], "Yahoo Finance"
+async def fetch_rss_news_async(symbol: str, company_name: str = "") -> list:
+    """Google News RSS search for the company, without blocking the event loop."""
     try:
-        articles = _from_yahoo(symbol)
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            response = await client.get(_rss_url(symbol, company_name))
+            response.raise_for_status()
+        return _parse_rss(response.content)
+    except Exception as err:
+        logger.warning(f"Google News RSS failed for {symbol}: {err}")
+        return []
+
+
+async def _yahoo_async(symbol: str) -> list:
+    try:
+        return await asyncio.to_thread(_from_yahoo, symbol)
     except Exception as err:
         logger.warning(f"Yahoo news unavailable for {symbol}: {err}")
-    if len(articles) < 4:
-        rss = fetch_rss_news(symbol, company_name)
-        if rss:
-            articles, source_label = articles + rss, ("Yahoo Finance and Google News" if articles else "Google News")
+        return []
+
+
+def select_articles(symbol: str, company_name: str, yahoo: list, rss: list) -> dict:
+    """Merges, filters and orders headlines: Google News is used only when Yahoo has
+    fewer than four; noise and unrelated headlines are dropped; newest first."""
+    articles, source_label = list(yahoo), "Yahoo Finance"
+    if len(articles) < 4 and rss:
+        articles, source_label = articles + rss, ("Yahoo Finance and Google News" if articles else "Google News")
 
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=MAX_AGE_DAYS)
     terms = _relevant_terms(symbol, company_name)
@@ -178,8 +188,20 @@ def get_news(symbol: str, company_name: str = "") -> dict:
         if os.getenv("ALLOW_MOCK_DATA", "false").lower() == "true":
             return get_mock_news(symbol)
         source_label = "No recent news available"
-
     return {"symbol": symbol, "total_articles": len(articles), "articles": articles, "source": source_label}
+
+
+async def fetch_news(symbol: str, company_name: str = "") -> dict:
+    """Recent headlines for a symbol. Yahoo (in a thread) and Google News RSS (async
+    HTTP) are fetched at the same time."""
+    symbol = symbol.upper().strip()
+    yahoo, rss = await asyncio.gather(_yahoo_async(symbol), fetch_rss_news_async(symbol, company_name))
+    return select_articles(symbol, company_name, yahoo, rss)
+
+
+def get_news(symbol: str, company_name: str = "") -> dict:
+    """Synchronous wrapper for scripts. Do not call from inside a running event loop."""
+    return asyncio.run(fetch_news(symbol, company_name))
 
 
 def get_mock_news(symbol: str) -> dict:

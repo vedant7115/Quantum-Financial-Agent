@@ -636,29 +636,63 @@ def assess_conflict(technical_score, fundamental_score):
     return False, ""
 
 
+MIN_CLOSES = 30
+
+
+def technical_score_of(trend: "Pillar", momentum: "Pillar"):
+    return _weighted([(trend.score, 0.65), (momentum.score, 0.35)])
+
+
+def fundamental_score_of(quality: "Pillar", growth: "Pillar", valuation: "Pillar", balance: "Pillar"):
+    return _weighted([(quality.score, 0.3), (growth.score, 0.3), (valuation.score, 0.25), (balance.score, 0.15)])
+
+
+def currency_for(symbol: str, stock_data: dict) -> str:
+    return stock_data.get("currency") or ("INR" if symbol.endswith((".NS", ".BO")) else "USD")
+
+
+def price_part(symbol: str, close: pd.Series, bench: pd.Series):
+    """Technical evidence: (facts, trend, momentum, stability, chart). Pure computation."""
+    if len(close) < MIN_CLOSES:
+        raise ValueError(f"Not enough price history for {symbol}")
+    _, bench_name = benchmark_for(symbol)
+    return analyse_price(close, bench if bench is not None and len(bench) else None, bench_name, symbol)
+
+
+def fundamental_part(symbol: str, stock_data: dict, statements: dict, last_close=None):
+    """Fundamental evidence: (facts or None, quality, growth, valuation, balance). Pure computation."""
+    return analyse_fundamentals(
+        statements, stock_data.get("price") or last_close, stock_data.get("market_cap_raw"),
+        currency_for(symbol, stock_data), stock_data.get("sector"),
+        stock_data.get("financial_currency"), stock_data.get("pe_ratio"))
+
+
 def build(symbol: str, stock_data: dict, articles: list) -> dict:
-    """Runs the full evidence pass for one symbol."""
-    bench_symbol, bench_name = benchmark_for(symbol)
+    """Runs the full evidence pass for one symbol, synchronously.
+    The API uses the async agents in agents/ instead; both call the same functions."""
+    bench_symbol, _ = benchmark_for(symbol)
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_close = pool.submit(_history, symbol, "5y")
         f_bench = pool.submit(_history, bench_symbol, "2y")
         f_stmt = pool.submit(_statements, symbol)
         f_cal = pool.submit(_calendar, symbol)
         close, bench, statements, events = f_close.result(), f_bench.result(), f_stmt.result(), f_cal.result()
+    price = price_part(symbol, close, bench)
+    fundamentals = fundamental_part(symbol, stock_data, statements, price[0]["last"])
+    return assemble(symbol, stock_data, close, price, fundamentals, _news_pillar(articles), events, articles)
 
-    if len(close) < 30:
-        raise ValueError(f"Not enough price history for {symbol}")
 
-    currency = stock_data.get("currency") or ("INR" if symbol.endswith((".NS", ".BO")) else "USD")
-    facts, trend, momentum, stability, chart = analyse_price(close, bench if len(bench) else None, bench_name, symbol)
-    fund_facts, quality, growth, valuation, balance = analyse_fundamentals(
-        statements, stock_data.get("price") or facts["last"], stock_data.get("market_cap_raw"), currency,
-        stock_data.get("sector"), stock_data.get("financial_currency"), stock_data.get("pe_ratio"))
-    news = _news_pillar(articles)
+def assemble(symbol: str, stock_data: dict, close: pd.Series, price: tuple, fundamentals: tuple,
+             news: "Pillar", events: dict, articles: list) -> dict:
+    """The consensus step: combines the three evidence parts into scores, confidence,
+    risk, findings and the report payload."""
+    currency = currency_for(symbol, stock_data)
+    facts, trend, momentum, stability, chart = price
+    fund_facts, quality, growth, valuation, balance = fundamentals
 
     pillars = [trend, momentum, stability, quality, growth, valuation, balance, news]
-    technical_score = _weighted([(trend.score, 0.65), (momentum.score, 0.35)])
-    fundamental_score = _weighted([(quality.score, 0.3), (growth.score, 0.3), (valuation.score, 0.25), (balance.score, 0.15)])
+    technical_score = technical_score_of(trend, momentum)
+    fundamental_score = fundamental_score_of(quality, growth, valuation, balance)
     composite = _weighted([(technical_score, 0.40), (fundamental_score, 0.45), (news.score, 0.15)])
 
     # Confidence is about the evidence, not about the direction: how much data we

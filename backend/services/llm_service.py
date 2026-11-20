@@ -1,115 +1,279 @@
 # llm_service.py
-# Reusable service for communicating with the Groq API.
-# Each report makes ONE call (the written brief), about 2,000 to 3,000 tokens.
-# Groq's free tier allows 8,000 tokens a minute per model, so the models below are
-# tried in turn: each has its own allowance, and a rate-limited model is skipped at once.
-# Configures strict timeouts and raises exceptions on failure to allow rule fallbacks.
+# Async Groq client with a fallback chain, per-model retry, rate-limit awareness
+# and one overall deadline.
+#
+# Chain: GROQ_MODEL (default gpt-oss-120b) -> gpt-oss-20b -> qwen3.8-27b.
+# For each model, in order:
+#   - Skip it if it is cooling down after a 429, or if Groq's last
+#     x-ratelimit-remaining-tokens says it cannot fit this request before its
+#     window resets. Once the cooldown or reset time passes it is used again
+#     (automatic recovery).
+#   - Call it. On 429 or 5xx, wait (Retry-After if given, capped at 3 s) and
+#     retry once; then move on. Timeouts, network errors and other 4xx move on
+#     at once.
+# Every attempt is bounded by the remaining overall deadline. If no model
+# answers, AllModelsFailed is raised and the caller uses its rule-written brief.
+#
+# Every call's model, status, tokens (from Groq's `usage`) and latency is logged
+# with the request_id and prompt_version, and added to usage_service.
 
-import os
+import asyncio
 import logging
+import os
+import re
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+
 import httpx
 from dotenv import load_dotenv
+
+from services import usage_service
 
 load_dotenv()
 
 logger = logging.getLogger("quantum_agent.llm_service")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# The 120b model follows the JSON format and the evidence-only rules reliably;
-# the 20b model often fails JSON validation on this prompt, so it is only a fallback.
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 # Order matters: qwen is last because its free tier allows only 1,000 output tokens a minute (about one brief).
 FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 # Ceiling on the answer, so one report can never use up a whole minute's allowance.
 MAX_OUTPUT_TOKENS = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1600"))
+PER_CALL_TIMEOUT = float(os.getenv("GROQ_CALL_TIMEOUT_SECONDS", "25"))
+MAX_RETRY_WAIT = 3.0
+MIN_TIME_FOR_CALL = 1.0  # do not start a call with less than this left on the deadline
 
-import re
+# Tests replace these: the HTTP transport (httpx.MockTransport) and the retry sleep.
+_transport = None
+_sleep = asyncio.sleep
+
+
+class AllModelsFailed(Exception):
+    def __init__(self, message: str, calls: list, deadline_exceeded: bool = False):
+        super().__init__(message)
+        self.calls = calls
+        self.deadline_exceeded = deadline_exceeded
+
+
+@dataclass
+class CallRecord:
+    model: str
+    step: int            # position in the chain, 0 = primary
+    attempt: int         # 0 = first try, 1 = retry
+    status: object       # HTTP status, or "timeout" / "network" / "skipped" / "deadline" / "bad_response"
+    latency_ms: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    error: str = ""
+
+
+@dataclass
+class LLMResult:
+    content: str
+    model: str
+    fallback_step: int
+    usage: dict
+    latency_ms: float
+    calls: list = field(default_factory=list)
+
+    @property
+    def fallback_used(self) -> bool:
+        return self.fallback_step > 0
+
 
 def clean_json_text(text: str) -> str:
-    """Strips markdown code blocks and extracts JSON object from LLM response."""
+    """Strips markdown code fences and extracts the outermost JSON object."""
     if not text:
         return text
     text = text.strip()
-    # Strip markdown backticks
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
-    # Match outermost curly braces to extract raw JSON
     match = re.search(r"(\{.*\})", text, re.DOTALL)
-    if match:
-        return match.group(1)
-    return text
+    return match.group(1) if match else text
 
-def query_groq_with_meta(prompt: str, system_prompt: str = None, response_json: bool = True,
-                         request_id: str = "-") -> dict:
-    """
-    Queries Groq, trying each model in turn until one answers.
 
-    Returns {"content", "model", "usage": {"prompt_tokens", "completion_tokens", "total_tokens"},
-    "attempts": [{"model", "status"}]}. Each model is tried once with a 25-second timeout;
-    any HTTP error (429 rate limit, 400 including Groq's json_validate_failed, 5xx),
-    timeout or network error moves to the next model. If every model fails, the last
-    error is raised so the caller can use its rule-written fallback.
-    """
-    raw_key = os.getenv("GROQ_API_KEY", "")
-    api_key = raw_key.strip().strip("'\"")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY is not defined in environment variables.")
+def _parse_duration(value):
+    """Groq reset headers look like "7.66s", "1m26.4s" or "250ms"; Retry-After is seconds."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    total, found = 0.0, False
+    for amount, unit in re.findall(r"([\d.]+)\s*(ms|h|m|s)", value):
+        found = True
+        total += float(amount) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+    return total if found else None
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
 
-    primary_model = os.getenv("GROQ_MODEL", DEFAULT_MODEL).strip().strip("'\"")
-    candidate_models = [primary_model]
-    for fallback_m in FALLBACK_MODELS:
-        if fallback_m not in candidate_models:
-            candidate_models.append(fallback_m)
+class RateLimitTracker:
+    """What Groq last told us about each model's per-minute token window."""
 
-    attempts = []
-    last_err = None
-    for model_name in candidate_models:
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_completion_tokens": MAX_OUTPUT_TOKENS,
-        }
-        if model_name.startswith("openai/gpt-oss"):
-            # The scores are already calculated; the model only writes, so little hidden reasoning is needed.
-            payload["reasoning_effort"] = "low"
-        if response_json:
-            payload["response_format"] = {"type": "json_object"}
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = {}  # model -> {"remaining": int|None, "reset_at": float, "cooldown_until": float}
 
-        try:
-            with httpx.Client() as client:
-                response = client.post(GROQ_URL, json=payload, headers=headers, timeout=25.0)
-                response.raise_for_status()
-                resp_data = response.json()
-            choices = resp_data.get("choices", [])
-            if not choices:
-                raise ValueError("Groq returned response without choices.")
-            content = choices[0]["message"]["content"]
+    def _get(self, model):
+        return self._state.setdefault(model, {"remaining": None, "reset_at": 0.0, "cooldown_until": 0.0})
+
+    def update(self, model: str, headers):
+        remaining = headers.get("x-ratelimit-remaining-tokens")
+        if remaining is None:
+            return
+        reset = _parse_duration(headers.get("x-ratelimit-reset-tokens"))
+        with self._lock:
+            state = self._get(model)
+            try:
+                state["remaining"] = int(float(remaining))
+            except ValueError:
+                return
+            state["reset_at"] = time.monotonic() + (reset if reset is not None else 60.0)
+
+    def cool_down(self, model: str, seconds: float):
+        with self._lock:
+            state = self._get(model)
+            state["cooldown_until"] = max(state["cooldown_until"], time.monotonic() + max(1.0, seconds))
+
+    def skip_reason(self, model: str, tokens_needed: int):
+        now = time.monotonic()
+        with self._lock:
+            state = self._state.get(model)
+            if not state:
+                return None
+            if now < state["cooldown_until"]:
+                return f"cooling down for {state['cooldown_until'] - now:.1f}s after a rate limit"
+            if state["remaining"] is not None and now < state["reset_at"] and state["remaining"] < tokens_needed:
+                return (f"near its token limit ({state['remaining']} left, about {tokens_needed} needed; "
+                        f"resets in {state['reset_at'] - now:.1f}s)")
+        return None
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            return {m: {"remaining_tokens": s["remaining"],
+                        "window_resets_in_s": round(max(0.0, s["reset_at"] - now), 1),
+                        "cooldown_s": round(max(0.0, s["cooldown_until"] - now), 1)}
+                    for m, s in self._state.items()}
+
+    def reset(self):
+        with self._lock:
+            self._state.clear()
+
+
+rate_limits = RateLimitTracker()
+
+
+def model_chain() -> list:
+    primary = os.getenv("GROQ_MODEL", DEFAULT_MODEL).strip().strip("'\"") or DEFAULT_MODEL
+    chain = [primary]
+    for model in FALLBACK_MODELS:
+        if model not in chain:
+            chain.append(model)
+    return chain
+
+
+def _api_key() -> str:
+    key = os.getenv("GROQ_API_KEY", "").strip().strip("'\"")
+    if not key:
+        raise ValueError("GROQ_API_KEY is not set")
+    return key
+
+
+def _log_call(record: CallRecord):
+    usage_service.record_llm_call(record.model, record.status, record.prompt_tokens, record.completion_tokens,
+                                  record.latency_ms, skipped=record.status == "skipped")
+    level = logging.INFO if record.status in (200, "skipped") else logging.WARNING
+    fields = {k: v for k, v in asdict(record).items() if k != "step"}
+    logger.log(level, "llm_call", extra={"event": {"type": "llm_call", "fallback_step": record.step, **fields}})
+
+
+async def generate(prompt: str, *, deadline_at: float, response_json: bool = True) -> LLMResult:
+    """Calls the chain until one model answers. deadline_at is an event-loop time (loop.time())."""
+    loop = asyncio.get_running_loop()
+    headers = {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
+    tokens_needed = len(prompt) // 4 + MAX_OUTPUT_TOKENS
+    calls = []
+
+    async with httpx.AsyncClient(transport=_transport) as client:
+        for step, model in enumerate(model_chain()):
+            reason = rate_limits.skip_reason(model, tokens_needed)
+            if reason:
+                record = CallRecord(model, step, 0, "skipped", error=reason)
+                calls.append(record)
+                _log_call(record)
+                continue
+
+            payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                       "temperature": 0.1, "max_completion_tokens": MAX_OUTPUT_TOKENS}
+            if model.startswith("openai/gpt-oss"):
+                # The scores are already calculated; the model only writes, so little hidden reasoning is needed.
+                payload["reasoning_effort"] = "low"
             if response_json:
-                content = clean_json_text(content)
-            raw_usage = resp_data.get("usage") or {}
-            usage = {k: int(raw_usage.get(k) or 0) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
-            attempts.append({"model": model_name, "status": response.status_code})
-            logger.info(f"[{request_id}] Groq ok model={model_name} prompt_tokens={usage['prompt_tokens']} "
-                        f"completion_tokens={usage['completion_tokens']} total_tokens={usage['total_tokens']}")
-            return {"content": content, "model": model_name, "usage": usage, "attempts": attempts}
-        except Exception as e:
-            last_err = e
-            err_body = getattr(e, "response", None)
-            status = err_body.status_code if err_body is not None else type(e).__name__
-            err_detail = err_body.text if err_body is not None else ""
-            attempts.append({"model": model_name, "status": status})
-            logger.warning(f"[{request_id}] Groq model {model_name} failed ({status}): {str(e)[:120]} | {err_detail[:200]}")
+                payload["response_format"] = {"type": "json_object"}
 
-    raise last_err
+            for attempt in range(2):
+                remaining = deadline_at - loop.time()
+                if remaining < MIN_TIME_FOR_CALL:
+                    record = CallRecord(model, step, attempt, "deadline", error="overall LLM deadline reached")
+                    calls.append(record)
+                    _log_call(record)
+                    raise AllModelsFailed("overall LLM deadline reached", calls, deadline_exceeded=True)
 
+                started = time.perf_counter()
+                try:
+                    response = await client.post(GROQ_URL, json=payload, headers=headers,
+                                                 timeout=min(PER_CALL_TIMEOUT, remaining))
+                except (httpx.TimeoutException, httpx.TransportError) as err:
+                    kind = "timeout" if isinstance(err, httpx.TimeoutException) else "network"
+                    record = CallRecord(model, step, attempt, kind,
+                                        round((time.perf_counter() - started) * 1000, 1), error=str(err)[:200])
+                    calls.append(record)
+                    _log_call(record)
+                    break
 
-def query_groq(prompt: str, system_prompt: str = None, response_json: bool = True) -> str:
-    """The model's text only. Kept for callers that do not need the model name or usage."""
-    return query_groq_with_meta(prompt, system_prompt, response_json)["content"]
+                latency = round((time.perf_counter() - started) * 1000, 1)
+                rate_limits.update(model, response.headers)
+                status = response.status_code
+
+                if status == 200:
+                    try:
+                        data = response.json()
+                        content = data["choices"][0]["message"]["content"]
+                    except (ValueError, KeyError, IndexError, TypeError) as err:
+                        record = CallRecord(model, step, attempt, "bad_response", latency, error=str(err)[:200])
+                        calls.append(record)
+                        _log_call(record)
+                        break
+                    usage = data.get("usage") or {}
+                    record = CallRecord(model, step, attempt, 200, latency,
+                                        int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0),
+                                        int(usage.get("total_tokens") or 0))
+                    calls.append(record)
+                    _log_call(record)
+                    return LLMResult(
+                        content=clean_json_text(content) if response_json else content,
+                        model=model, fallback_step=step, latency_ms=latency, calls=calls,
+                        usage={"prompt_tokens": record.prompt_tokens, "completion_tokens": record.completion_tokens,
+                               "total_tokens": record.total_tokens})
+
+                record = CallRecord(model, step, attempt, status, latency, error=response.text[:200])
+                calls.append(record)
+                _log_call(record)
+
+                retry_after = _parse_duration(response.headers.get("retry-after"))
+                if status == 429:
+                    rate_limits.cool_down(model, retry_after or _parse_duration(
+                        response.headers.get("x-ratelimit-reset-tokens")) or 10.0)
+                retryable = status == 429 or status >= 500
+                if not retryable or attempt == 1:
+                    break
+                wait = min(MAX_RETRY_WAIT, retry_after if retry_after is not None else 1.0)
+                if deadline_at - loop.time() - wait < MIN_TIME_FOR_CALL:
+                    break
+                await _sleep(wait)
+
+    raise AllModelsFailed("no model answered", calls)

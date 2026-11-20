@@ -2,6 +2,7 @@
 # Verification script to test that all backend services and agents function end-to-end.
 # Run this within the backend directory: python test_verification.py
 
+import asyncio
 import sys
 import os
 import io
@@ -64,11 +65,11 @@ def run_test(symbol):
         sent_res = sentiment_agent.analyze(news_data)
         print(f"7. Sentiment Agent: {sent_res['sentiment']} (confidence {sent_res['confidence']}%)")
 
-        master_res = master_agent.analyze(tech_res, fund_res, sent_res, research, request_id="manual-check")
+        master_res = asyncio.run(master_agent.analyze(tech_res, fund_res, sent_res, research))
         llm = master_res.pop("llm")
         print(f"8. Master brief: bias {master_res['market_bias']}, confidence {master_res['confidence']}%, "
               f"outcome {llm['outcome']}, model {llm['model']}, prompt {llm['prompt_version']}, "
-              f"tokens {llm['usage']['total_tokens']}")
+              f"tokens {llm['tokens']['total']}")
         if llm["rejections"]:
             print(f"   - Rejections: {llm['rejections']}")
         print(f"   - Summary: {master_res['summary'][:150]}...")

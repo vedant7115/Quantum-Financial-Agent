@@ -4,11 +4,15 @@
 # The stance, confidence and risk level are calculated in research_engine.py and
 # are final. The language model's only job is to explain them: it receives the
 # findings with their numbers and may not introduce figures, dates or events of
-# its own. Its answer must match the Brief schema below and pass two checks
+# its own. Its answer must match the Brief schema below and pass two guardrails
 # (no advice wording, no numbers missing from the evidence). A failed answer is
-# retried once with the reason attached; if that also fails, or no model is
-# available, a plain rule-written version of the same evidence is used instead.
+# retried once with the reason attached; if that also fails, no model answers,
+# or the overall LLM deadline passes, a rule-written version of the same
+# evidence is used instead.
+#
+# The prompt text lives in prompts/ (versioned); PROMPT_VERSION selects it.
 
+import asyncio
 import logging
 import os
 import re
@@ -17,13 +21,11 @@ from typing import List, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator
 from typing_extensions import Annotated
 
-from services.llm_service import query_groq_with_meta
+import prompts
+from core.context import prompt_version_var, span
+from services import llm_service, usage_service
 
 logger = logging.getLogger("quantum_agent.master_agent")
-
-# Bump this whenever the prompt text or the expected JSON shape changes. It is
-# logged and returned with every report so a brief can be traced to its prompt.
-PROMPT_VERSION = "v2.0"
 
 ADVICE_PATTERN = re.compile(
     r"\b(strong buy|buy rating|sell rating|we recommend|should (buy|sell|hold)|"
@@ -156,7 +158,7 @@ def _rule_view(research: dict, sentiment: dict) -> dict:
     if concerns:
         parts.append("Against it: " + "; ".join(c["title"] for c in concerns[:3]) + ".")
     if research.get("conflicted"):
-        parts.append(research["conflict_note"])
+        parts.append("Mixed signals: " + research["conflict_note"])
     if not research["coverage"]["financials"]:
         parts.append("Company financials could not be retrieved, so this view rests on price behaviour and news only.")
 
@@ -194,97 +196,107 @@ def _rule_view(research: dict, sentiment: dict) -> dict:
     }
 
 
-def _prompt(research: dict, evidence: str) -> str:
+def build_prompt(research: dict, evidence: str, version: str) -> str:
     stance = {"Bullish": "leans positive", "Bearish": "leans negative", "Neutral": "is mixed"}[research["bias"]]
-    conflict = ""
-    if research.get("conflicted"):
-        conflict = ("\nThe price evidence and the business evidence point in opposite directions; "
-                    "make that tension the centre of the second paragraph of the summary.")
-    schema = (
-        '{\n'
-        '  "summary": "Two short paragraphs separated by \\n\\n. First: what the evidence says overall and the two or '
-        'three facts that matter most, with their numbers. Second: the main tension or uncertainty in the picture. '
-        'Do not mention the historical record in the summary; it may be used in the cases below.",\n'
-        '  "key_drivers": ["3 to 5 separate strings, each a short phrase naming one fact that drives the view, with its number"],\n'
-        '  "bull_case": ["3 or 4 separate strings, one sentence each: the strongest honest argument for the stock, each tied to a number above"],\n'
-        '  "bear_case": ["3 or 4 separate strings, one sentence each: the strongest honest argument against it, each tied to a number above"],\n'
-        f'  "risk_register": [{{"category": "one of {RISK_CATEGORIES}", "severity": "Low|Medium|High", '
-        '"probability": "Low|Medium|High", "explanation": "one sentence grounded in the evidence"}]\n'
-        '}'
-    )
-    return f"""You are writing an equity research brief for a retail investor about {research.get('name')}.
-All analysis below was calculated from market data and the company's reported financial statements.
-
-EVIDENCE
-{evidence}
-
-CALCULATED RESULT (final, do not change): the evidence {stance}; overall {research['composite']}/100;
-confidence {research['confidence']}%; risk level {research['risk']}.{conflict}
-
-RULES
-- Use ONLY the evidence above. Every number you write must appear in the evidence exactly.
-- Do not add facts from memory: no products, executives, competitors, events, dates or forecasts that are not above.
-- Never tell the reader to buy, sell or hold, and never give a target price. Explain; do not advise.
-- Do not predict or imply future returns. The historical record describes the past only; say so if you mention it.
-- Plain English. Short sentences. If you use a term such as RSI or free cash flow, say what it means in a few words.
-- If a pillar was not assessed, say so rather than guessing.
-
-Return ONLY a JSON object:
-{schema}
-Give 3 to 5 risk_register entries, only for risks the evidence supports."""
+    return prompts.render(
+        version, conflicted=bool(research.get("conflicted")),
+        name=research.get("name"), evidence=evidence, stance=stance, composite=research["composite"],
+        confidence=research["confidence"], risk=research["risk"], categories=str(RISK_CATEGORIES))
 
 
-def analyze(technical: dict, fundamental: dict, sentiment: dict, research: dict, request_id: str = "-") -> dict:
+def _mixed_signals(summary: str, research: dict) -> str:
+    """A conflicted report always says "Mixed signals", whatever the model wrote."""
+    if research.get("conflicted") and "mixed signals" not in summary.lower():
+        return f"Mixed signals: {research.get('conflict_note', '')}\n\n{summary}".strip()
+    return summary
+
+
+def _calls(records) -> list:
+    return [{"model": r.model, "fallback_step": r.step, "attempt": r.attempt, "status": r.status,
+             "latency_ms": r.latency_ms, "total_tokens": r.total_tokens, "error": r.error[:160]}
+            for r in records]
+
+
+def _llm_block(version: str) -> dict:
+    return {"model": None, "prompt_version": version, "outcome": "rule",
+            "tokens": {"prompt": 0, "completion": 0, "total": 0}, "latency_ms": 0.0,
+            "fallback_used": False, "fallback_step": None, "deadline_exceeded": False,
+            "attempts": [], "rejections": []}
+
+
+async def analyze(technical: dict, fundamental: dict, sentiment: dict, research: dict,
+                  deadline_at: float = None) -> dict:
     """The final decision. Bias, confidence and risk come from research; the model
-    only writes the text. The returned "llm" block (prompt version, model, token
-    usage, attempts, outcome, rejection reasons) is logged and sent to the client."""
+    only writes the text. The returned "llm" block (model, prompt version, tokens,
+    latency, fallback, attempts, outcome) goes into the logs, the trace and the response."""
+    loop = asyncio.get_running_loop()
+    if deadline_at is None:
+        deadline_at = loop.time() + float(os.getenv("LLM_DEADLINE_SECONDS", "30"))
+    current = prompt_version_var.get()
+    version = current if current in prompts.PROMPT_VERSIONS else prompts.active_version()
     view = _rule_view(research, sentiment)
-    llm_meta = {"prompt_version": PROMPT_VERSION, "model": None, "outcome": "rule",
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "attempts": [], "rejections": []}
+    llm = _llm_block(version)
 
     if os.getenv("GROQ_API_KEY"):
         evidence = _evidence_text(research, sentiment)
-        prompt = _prompt(research, evidence)
+        prompt = build_prompt(research, evidence, version)
         # One retry: if an answer fails validation, ask once more with the reason
-        # attached. A transport failure is not retried here, because
-        # query_groq_with_meta has already tried every model in the chain.
+        # attached. A transport failure is not retried here, because generate()
+        # has already worked through the whole model chain.
         for attempt in range(2):
             text = prompt
             if attempt:
-                text += (f"\n\nYour previous answer was rejected: {llm_meta['rejections'][-1]}. "
+                text += (f"\n\nYour previous answer was rejected: {llm['rejections'][-1]}. "
                          "Return a corrected JSON object that follows every rule.")
-            try:
-                result = query_groq_with_meta(text, request_id=request_id)
-            except Exception as err:
-                llm_meta["rejections"].append(f"no model answered: {str(err)[:160]}")
-                break
-            for key in llm_meta["usage"]:
-                llm_meta["usage"][key] += result["usage"].get(key, 0)
-            llm_meta["attempts"].extend(result["attempts"])
-            llm_meta["model"] = result["model"]
-            try:
-                brief = check_brief(result["content"], evidence)
-            except ValidationError as err:
-                errors = err.errors()
-                first = errors[0] if errors else {}
-                where = ".".join(str(x) for x in first.get("loc", ())) or "JSON"
-                llm_meta["rejections"].append(f"invalid output at {where}: {first.get('msg', 'parse error')}")
-                continue
-            except BriefRejected as err:
-                llm_meta["rejections"].append(str(err))
+            brief = None
+            with span(f"llm.generate#{attempt + 1}") as sp:
+                try:
+                    result = await llm_service.generate(text, deadline_at=deadline_at)
+                except llm_service.AllModelsFailed as err:
+                    llm["attempts"].extend(_calls(err.calls))
+                    llm["deadline_exceeded"] = err.deadline_exceeded
+                    llm["rejections"].append(f"no model answered: {err}")
+                    sp.update(status="error", calls=len(err.calls))
+                    break
+                except Exception as err:
+                    llm["rejections"].append(f"LLM call failed: {str(err)[:160]}")
+                    sp.update(status="error")
+                    break
+                llm["attempts"].extend(_calls(result.calls))
+                for key, src in (("prompt", "prompt_tokens"), ("completion", "completion_tokens"),
+                                 ("total", "total_tokens")):
+                    llm["tokens"][key] += result.usage.get(src, 0)
+                llm["latency_ms"] = round(llm["latency_ms"] + result.latency_ms, 1)
+                llm["model"], llm["fallback_step"] = result.model, result.fallback_step
+                llm["fallback_used"] = llm["fallback_used"] or result.fallback_used
+                sp.update(model=result.model, fallback_step=result.fallback_step,
+                          total_tokens=result.usage.get("total_tokens"), latency_ms=result.latency_ms)
+                try:
+                    brief = check_brief(result.content, evidence)
+                except ValidationError as err:
+                    errors = err.errors()
+                    first = errors[0] if errors else {}
+                    where = ".".join(str(x) for x in first.get("loc", ())) or "JSON"
+                    llm["rejections"].append(f"invalid output at {where}: {first.get('msg', 'parse error')}")
+                    sp.update(status="rejected")
+                except BriefRejected as err:
+                    llm["rejections"].append(str(err))
+                    sp.update(status="rejected")
+            if brief is None:
                 continue
             data = brief.model_dump()
             for field in ("summary", "key_drivers", "bull_case", "bear_case", "risk_register"):
                 view[field] = data[field]
-            llm_meta["outcome"] = "ai" if attempt == 0 else "ai_after_retry"
+            llm["outcome"] = "ai" if attempt == 0 else "ai_after_retry"
             break
 
-    logger.info(f"[{request_id}] brief prompt_version={PROMPT_VERSION} outcome={llm_meta['outcome']} "
-                f"model={llm_meta['model']} prompt_tokens={llm_meta['usage']['prompt_tokens']} "
-                f"completion_tokens={llm_meta['usage']['completion_tokens']} "
-                f"total_tokens={llm_meta['usage']['total_tokens']} calls={len(llm_meta['attempts'])} "
-                f"rejections={llm_meta['rejections']}")
+    view["summary"] = _mixed_signals(view["summary"], research)
+    usage_service.record_brief(llm["outcome"], llm["fallback_used"], llm["deadline_exceeded"])
+    logger.info("brief", extra={"event": {
+        "type": "brief", "outcome": llm["outcome"], "model": llm["model"], "fallback_step": llm["fallback_step"],
+        "prompt_tokens": llm["tokens"]["prompt"], "completion_tokens": llm["tokens"]["completion"],
+        "total_tokens": llm["tokens"]["total"], "latency_ms": llm["latency_ms"],
+        "calls": len(llm["attempts"]), "rejections": llm["rejections"]}})
 
     return {
         "market_bias": research["bias"],
@@ -296,10 +308,10 @@ def analyze(technical: dict, fundamental: dict, sentiment: dict, research: dict,
         "potential_risks": view["potential_risks"],
         "future_catalysts": view["future_catalysts"],
         "summary": view["summary"],
-        "fallback_active": llm_meta["outcome"] == "rule",
+        "fallback_active": llm["outcome"] == "rule",
         "bull_case": view["bull_case"],
         "bear_case": view["bear_case"],
         "risk_register": view["risk_register"],
         "catalyst_calendar": research["calendar"],
-        "llm": llm_meta,
+        "llm": llm,
     }
