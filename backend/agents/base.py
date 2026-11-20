@@ -9,6 +9,7 @@
 # consensus step combines them. Agents never call the language model.
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 
 from core.context import span
@@ -104,11 +105,20 @@ class SentimentAgent(Agent):
 AGENTS = [TechnicalAgent(), FundamentalAgent(), SentimentAgent()]
 
 
+# yfinance has no overall timeout of its own; an agent that takes longer than this
+# is abandoned (its worker thread finishes in the background) so the request
+# stays inside the frontend's 45-second limit.
+AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "15"))
+
+
 async def run_agent(agent: Agent, evidence: Evidence, ctx: AgentContext) -> AgentResult:
-    """Runs one agent inside its own trace span. Never raises: a failure becomes status "error"."""
+    """Runs one agent inside its own trace span, with a timeout. Never raises: a
+    failure or timeout becomes status "error"."""
     with span(f"agent.{agent.name}") as sp:
         try:
-            result = await agent.run(evidence, ctx)
+            result = await asyncio.wait_for(agent.run(evidence, ctx), timeout=AGENT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            result = AgentResult(agent.name, "error", error=f"timed out after {AGENT_TIMEOUT_SECONDS:.0f}s")
         except Exception as err:
             result = AgentResult(agent.name, "error", error=f"{type(err).__name__}: {str(err)[:200]}")
         sp.update(status=result.status, score=None if result.score is None else round(result.score, 1))

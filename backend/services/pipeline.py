@@ -45,8 +45,10 @@ async def build_report(symbol: str, request_started: float) -> dict:
 
     technical, fundamental, sentiment = await asyncio.gather(*(run_agent(a, evidence, ctx) for a in AGENTS))
 
+    if technical.status == "unavailable":
+        raise InsufficientHistory(technical.error or "price history too short")
     if technical.status != "ok":
-        raise InsufficientHistory(technical.error or "price history unavailable")
+        raise stock_service.MarketDataUnavailable(technical.error or "price history unavailable")
 
     with span("consensus") as sp:
         research, sections = await asyncio.to_thread(_consensus, symbol, stock_data, technical, fundamental, sentiment)

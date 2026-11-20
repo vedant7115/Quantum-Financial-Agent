@@ -163,3 +163,23 @@ def test_ticker_resolution_and_new_listing_errors(app, monkeypatch):
     fake, new = asyncio.run(run())
     assert fake.status_code == 400 and fake.json()["detail"] == "INVALID_TICKER"
     assert new.status_code == 422 and new.json()["detail"] == "INSUFFICIENT_HISTORY"
+
+
+def test_slow_agent_times_out_without_sinking_the_report(app, monkeypatch):
+    from agents import base
+    from services import research_engine
+
+    monkeypatch.setattr(base, "AGENT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(research_engine, "_statements", lambda s: (time.sleep(2), {})[1])
+
+    async def run():
+        async with _client(app) as client:
+            return await _post(client, "ORCL", "10.0.3.1")
+
+    response, elapsed = asyncio.run(run())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["insight"]["agent_scores"]["fundamental"]["status"] == "error"
+    assert "timed out" in body["insight"]["agent_scores"]["fundamental"]["error"]
+    assert body["insight"]["coverage"]["financials"] is False
+    assert elapsed < 1.8

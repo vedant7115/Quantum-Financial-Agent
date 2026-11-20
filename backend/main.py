@@ -5,7 +5,11 @@
 #   /docs   ← Swagger UI
 #   /redoc  ← ReDoc UI
 
+import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.routes import router
@@ -14,8 +18,24 @@ from dotenv import load_dotenv
 # Load environment variables at server start
 load_dotenv()
 
+# ── Thread pool for blocking work ────────────────────────────────────────────
+# asyncio.to_thread uses the loop's default executor. Python sizes it from the
+# CPU count (5 threads on a 1-CPU instance), but one report runs up to six
+# blocking fetches at once, so the pool is sized for I/O instead.
+THREAD_POOL_SIZE = int(os.getenv("THREAD_POOL_SIZE", "32"))
+
+
+@asynccontextmanager
+async def lifespan(app):
+    executor = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE, thread_name_prefix="quantum-io")
+    asyncio.get_running_loop().set_default_executor(executor)
+    yield
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
 # ── Create the FastAPI Application ───────────────────────────────────────────
 app = FastAPI(
+    lifespan=lifespan,
     title="QUANTUM AGENT API",
     description="Multi-Agent Financial Intelligence Platform — Technical, Fundamental & Sentiment Analysis",
     version="2.1.0",
