@@ -1,10 +1,12 @@
 # QUANTUM Renovation Report (v2.1.0)
 
-Written 2026-11-20 from branch `feat/v2.1-ops`. **Not deployed:** production still runs v2.0.0 until this branch is merged and deployed.
+Updated 2026-11-20. **Deployed:** v2.1.0 is merged into `main` (tag `v2.1.0`) and live on Render (backend) and Vercel (frontend), checked live on 2026-11-20 (section 3b).
 
 - **v1:** commit `9b4a208`, before the renovation.
 - **v2.0:** tag `v2.0.0`.
-- **v2.1:** this branch.
+- **v2.1:** tag `v2.1.0`.
+
+The interview study pack is in `INTERVIEW_STUDY_v2.1.md`; the plan for what comes next is in `FUTURE_PLAN.md`.
 
 Every item carries one label:
 
@@ -12,7 +14,7 @@ Every item carries one label:
 - **PARTIAL**: present but limited; the limit is stated.
 - **NOT IMPLEMENTED**: not in the code. Do not claim it.
 
-Measured numbers come from section 3. They were run on one Windows laptop against live Yahoo and Groq on 2026-11-20, with three stocks per run. Quote them as approximate.
+Measured numbers come from section 3: **3a is local** (one Windows laptop against live Yahoo and Groq) and **3b is live** (the deployed Render service, called from the internet). All runs were on 2026-11-20 with a few stocks each, so quote them as approximate.
 
 ---
 
@@ -28,7 +30,7 @@ Measured numbers come from section 3. They were run on one Windows laptop agains
 | Observability | Plain logs | Plain logs | JSON logs with request_id; per-call tokens and latency; traces; `/api/admin/usage` and `/api/admin/traces` |
 | Prompt | Inline f-string | Inline f-string | Versioned files with registry and changelog |
 | Cache | Dict, 60 s, no lock | Dict, 900 s, no lock | Four tiers, lock, coalescing, counters |
-| Tests | None | None | 25 offline pytest tests |
+| Tests | None | None | 25 offline pytest tests, run by GitHub Actions on every push and pull request |
 
 - **v1 → v2.0:** rebuilt the analysis as a deterministic evidence engine and redesigned the app. Real fundamentals; no invented tickers, headlines or dates; Free / ₹149 / ₹499 plans.
 - **v2.0 → v2.1:** operations work only. Async fan-out, tracing, prompt versioning, usage observability, validated output, retries with a deadline, tiered cache, a conflict flag, ticker resolution, and dead-code removal. Scoring formulas, weights and thresholds are unchanged; the response only gains fields.
@@ -50,6 +52,8 @@ Measured numbers come from section 3. They were run on one Windows laptop agains
 ---
 
 ## 3. Measured benchmark
+
+### 3a. Local: v2.0 against v2.1
 
 **Method.**
 - Each version was run in its own process through FastAPI's ASGI transport, against live Yahoo and Groq, with an empty cache and `GROQ_MODEL=openai/gpt-oss-120b`.
@@ -77,6 +81,36 @@ What this shows:
 - **Measurement note:** in the concurrent phase, the per-request token figures in the raw script output overlap, because the requests shared one call list. The totals above are the real ones.
 
 Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 tokens per report (2026-11-20).
+
+**Release check (local, v2.1.0 from `main` before the push, real Uvicorn server, `GROQ_MODEL=openai/gpt-oss-120b`):**
+
+| Request | Result | Time | Model | Tokens (prompt / completion / total) |
+| :-- | :-- | :-- | :-- | :-- |
+| MSFT | 200, AI brief | 6.6 s | gpt-oss-120b | 1,366 / 1,011 / 2,377 |
+| HDFCBANK (typed without suffix) | 200, resolved to HDFCBANK.NS, AI brief | 4.3 s | gpt-oss-120b | 1,269 / 739 / 2,008 |
+| ZZQXQ (invalid) | 400 `INVALID_TICKER` | 2.1 s | – | – |
+| NVDA, ITC, KO at the same time | all 200, AI briefs | **7.1 s wall time** | gpt-oss-120b | 1,893 / 1,989 / 2,241 |
+| JPM twice at the same time | both 200; second is `coalesced` | 4.2 s | gpt-oss-20b (120b was skipped: 68 tokens left in its minute) | 1,656 |
+
+Report-cache counter `coalesced` went from 0 to 1, so the two JPM requests computed once. The 20b fallback on JPM is the rate-limit skip working as designed: five 120b calls inside one minute had used its 8,000-token allowance.
+
+### 3b. Live: the deployed service (Render, 2026-11-20)
+
+Called from a laptop over the internet against `quantum-financial-agent.onrender.com`, Render's single instance, empty cache.
+
+| Request | Result | Time | Model | Tokens (prompt / completion / total) |
+| :-- | :-- | :-- | :-- | :-- |
+| AAPL | 200, AI brief | 7.9 s | gpt-oss-120b, prompt v2.1 | 1,280 / 760 / 2,040 |
+| RELIANCE (typed without suffix) | 200, resolved to RELIANCE.NS, AI brief | 5.1 s | gpt-oss-120b, prompt v2.1 | 1,326 / 620 / 1,946 |
+| MSFT, TCS, KO at the same time | all 200, AI briefs | **11.6 s wall time** (single reports 10.7–11.6 s) | gpt-oss-120b | 2,223 / 1,945 / 2,181 |
+| JPM twice at the same time | both 200; second is `coalesced` | 6.5 s | gpt-oss-120b | 1,752 |
+
+- **Trace spans on every fresh report:** `validate`, `quote`, `report`, `agent.technical`, `agent.fundamental`, `agent.sentiment`, `consensus`, `brief`, `llm.generate#1`. The coalesced request shows only `validate` and `report`, plus the builder's `generation_spans`.
+- **No report fell back to the rule-written brief**, locally or live.
+- **Admin endpoints live:** `/api/admin/traces` and `/api/admin/usage` return 403 with no token or a wrong token, and 200 with the right `x-admin-token`.
+- **Access keys live:** with a valid Pro key `/api/usage` reports plan `pro`; without one, `free`.
+- **Frontend live:** `quantum-financial-agent.vercel.app/#/s/AAPL` loads a full report with no console errors.
+- **Found live (not caused by v2.1):** on Render, Yahoo does not return company names, so names fall back to "AAPL Corp."; because Google News is searched by name, AAPL got 0 headlines and "News flow: not assessed". The fallback (`stock_service.get_stock_data`, line 251) dates from June 2026. See gap 13.
 
 ---
 
@@ -175,7 +209,7 @@ Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 
 
 | Item | Status | Detail |
 | :-- | :-- | :-- |
-| 9. Pytest suite with mocked Groq | VERIFIED IN CODE | 25 tests, about 6 s, fully offline: `tests/test_llm_chain.py` (429 chain, 5xx, skip and recovery, near-limit, deadline, all-fail, token logging, guardrails, prompt registry), `test_master_brief.py`, `test_research_engine.py`, `test_cache_service.py`, `test_api_pipeline.py` (fan-out, concurrency, coalescing, admin auth, ticker errors, agent timeout). **No CI runs them** |
+| 9. Pytest suite with mocked Groq | VERIFIED IN CODE | 25 tests, about 6 s, fully offline: `tests/test_llm_chain.py` (429 chain, 5xx, skip and recovery, near-limit, deadline, all-fail, token logging, guardrails, prompt registry), `test_master_brief.py`, `test_research_engine.py`, `test_cache_service.py`, `test_api_pipeline.py` (fan-out, concurrency, coalescing, admin auth, ticker errors, agent timeout). Run by GitHub Actions (`.github/workflows/tests.yml`, Python 3.11, no secrets) on every push and pull request; first run passed |
 | 9b. `test_verification.py` | VERIFIED IN CODE | Manual live script; runs the engine, the agent formatters and the async brief for AAPL and INFY; exits non-zero on failure |
 | 10a. Partial report for new listings | NOT IMPLEMENTED | Fewer than 30 closes now returns a clear `422 INSUFFICIENT_HISTORY` with a frontend message instead of a 500. A report without price data would need frontend changes |
 | 10b. Indian ticker lookup | VERIFIED IN CODE | `stock_service.resolve_and_validate`: tries the symbol as typed, then `.NS`, then `.BO`. Live: ASIANPAINT → ASIANPAINT.NS, MARUTI → MARUTI.NS. This is a fallback, not a search API |
@@ -196,17 +230,21 @@ Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 
 | yfinance, pandas, NumPy | Yes | data and scoring |
 | Groq: gpt-oss-120b, gpt-oss-20b, qwen3.8-27b | Yes | `llm_service.py` |
 | pytest | Yes | `backend/tests`, `requirements-dev.txt` |
+| GitHub Actions (CI) | Yes, tests only | `.github/workflows/tests.yml`; it runs tests, it does not deploy |
 | React 19, Vite, Recharts | Yes | `frontend/` |
 | n8n, LangChain, Flask, Next.js | **No** | Not in the code |
 | Docker | **No** | Empty files removed |
 | OpenRouter, Gemini | **No** | Removed |
-| Redis, Postgres, OpenTelemetry, CI | **No** | Not in the code |
+| Redis, Postgres, OpenTelemetry, CD pipeline | **No** | Not in the code; deploys are Render's and Vercel's own auto-deploy from `main` |
+| Razorpay or any payment gateway | **No** | Not in the code; paid keys are issued by hand |
 
 ---
 
 ## 7. Deployment
 
-### What you must set or change
+**Status: done on 2026-11-20.** `main` = merge of `feat/v2.1-ops` plus the changelog and CI commits, tagged `v2.1.0`; Render and Vercel auto-deployed it, and the live checks are in section 3b. Rollback: redeploy the previous Render deploy (v2.0.0) from the Render dashboard, or set `PROMPT_VERSION=v2.0` to roll back only the prompt.
+
+### What was set or changed
 
 **Render (backend web service):**
 
@@ -218,7 +256,8 @@ Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 
 | Optional: `PROMPT_VERSION=v2.1` | Already the default; set it only to pin or roll back (`v2.0`) |
 | Optional: `LOG_FORMAT=json` | Already the default |
 | Optional: cache and timing overrides | `CACHE_TTL_SECONDS` (300), `CACHE_TTL_PRICES` (300), `CACHE_TTL_NEWS` (1800), `CACHE_TTL_FUNDAMENTALS` (86400), `LLM_DEADLINE_SECONDS` (30), `REQUEST_BUDGET_SECONDS` (42), `AGENT_TIMEOUT_SECONDS` (15), `THREAD_POOL_SIZE` (32) |
-| Check | `GROQ_API_KEY` and `ACCESS_KEY_SECRET` are still set |
+| Check | `GROQ_API_KEY` is still set |
+| Set `ACCESS_KEY_SECRET` | Without it every visitor is on Free and no Plus/Pro key works (`billing_service.verify_access_key`). Set on 2026-11-20; a Pro key was verified live |
 | No change | Build command (`pip install -r requirements.txt`) and start command (`python main.py`) stay the same; `requirements.txt` only lost `google-generativeai` |
 
 **Vercel (frontend):**
@@ -228,15 +267,12 @@ Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 
 | Nothing required | `VITE_API_URL` is unchanged. The only frontend changes are deleted unused files and one new error message |
 | Note | The Hobby plan does not allow commercial use (unchanged from before) |
 
-**Deploy steps:** merge `feat/v2.1-ops` into `main` and push; Render and Vercel auto-deploy from `main`. After deploying, check:
-- `GET /` reports `"version": "2.1.0"`;
-- one report returns `llm` and `trace`;
-- `GET /api/admin/usage` with the `x-admin-token` header returns counts.
+**Post-deploy checks (all passed live):** `GET /` reports `"version": "2.1.0"`; reports return `llm` and `trace`; `GET /api/admin/usage` and `/api/admin/traces` answer only with the `x-admin-token` header.
 
 ### Not verified
 
-- Behaviour on Render itself: everything above was run locally.
-- Uvicorn's lifespan sets the thread pool; it runs under `python main.py`. FastAPI's `ASGITransport`, which the tests use, does not run lifespan, so the tests do not cover the pool size.
+- Uvicorn's lifespan sets the thread pool; it runs under `python main.py`. FastAPI's `ASGITransport`, which the tests use, does not run lifespan, so the tests do not cover the pool size. The live concurrency run (3b) is the only evidence it works on Render.
+- Behaviour under real traffic: the live runs were a handful of requests from one machine.
 
 ---
 
@@ -244,7 +280,7 @@ Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 
 
 1. **All state is in memory, per process:** cache, quotas, rate limits, usage aggregates, traces. Lost on restart; wrong with more than one instance. No Redis or Postgres.
 2. **No user accounts, no payments.** Plan keys are issued by hand.
-3. **No CI;** the tests run locally only.
+3. **CI runs tests only.** No automated deploy gate: Render and Vercel deploy from `main` whether or not the tests pass.
 4. **No quality evaluation** of briefs, and no backtest or calibration of scores or confidence.
 5. **No partial report** for listings with fewer than 30 closes (422 instead).
 6. **Frontend gaps:** it does not show `insight.conflict`, `insight.agent_scores`, `llm` or `trace`.
@@ -254,6 +290,8 @@ Earlier measurements for context: v1 with all four LLM calls used 8,368–8,394 
 10. **Open surface:** `/docs` is public and CORS is `*`.
 11. **Data licensing:** data is from Yahoo via yfinance, which is not licensed for commercial use. Google News sometimes returns 429 and Yahoo news is sometimes down.
 12. **Hosting and regulation:** Vercel Hobby does not allow commercial use, and SEBI research-analyst registration is not resolved.
+13. **Company names on Render:** Yahoo's company-info call returns nothing from Render, so names show as "AAPL Corp." and the name-based news search can find nothing (AAPL live: 0 headlines). Pre-existing since v2.0; first item in `FUTURE_PLAN.md`.
+14. **No evaluation set** for brief quality, **no calibration** of confidence, and **one Uvicorn worker** on one instance.
 
 ---
 
@@ -268,13 +306,16 @@ Every line below is VERIFIED IN CODE and backed by a test or a measured run.
 - Added observability: per-request IDs propagated with contextvars, timed trace spans per agent and LLM call, JSON logs, per-call token and latency logging, and admin endpoints for daily usage and recent traces.
 - Introduced versioned prompt templates with a registry and changelog, selectable by environment variable and recorded with every report.
 - Implemented a thread-safe tiered TTL cache (prices, news, fundamentals, reports) with in-flight request coalescing, so identical concurrent requests compute once.
-- Covered the engine, LLM chain, guardrails, cache and API concurrency with 25 offline pytest tests using a mocked Groq transport.
+- Covered the engine, LLM chain, guardrails, cache and API concurrency with 25 offline pytest tests using a mocked Groq transport, run by GitHub Actions on every push and pull request.
+- Deployed the FastAPI backend on Render and the React frontend on Vercel, and verified the release live: version endpoint, AI briefs from gpt-oss-120b, request coalescing and admin-endpoint authentication.
 
-**Do not write:** LangChain, n8n, Docker, Redis, OpenTelemetry or "distributed tracing", CI/CD, "calibrated" or "backtested", "production-scale", or any user or revenue numbers.
+**Do not write:** LangChain, n8n, Docker, Redis, OpenTelemetry or "distributed tracing", "CI/CD" (it is CI for tests only), payments or Razorpay, "calibrated" or "backtested", "production-scale", "live users", or any user or revenue numbers.
 
 ---
 
 ## 10. Interview prep
+
+A fuller pack (code reading guide, 30 questions, do-not-claim list, 2-minute walkthrough) is in `INTERVIEW_STUDY_v2.1.md`. The ten core answers:
 
 **1. Are these real agents?**
 They are concurrent workers behind one interface, not autonomous LLM agents. Each fetches its own data and computes its pillars deterministically. Only the brief step calls an LLM, and it cannot change the scores.
@@ -304,4 +345,4 @@ Each version is a template file in a registry with a changelog. `PROMPT_VERSION`
 Per call: model, status, prompt and completion tokens, latency and fallback step. Per day: totals per model, brief outcomes, fallback counts and cache hit rates, at `/api/admin/usage`. It is in memory; the next step is persisting it.
 
 **10. What would you do next?**
-Move cache, quotas, usage and traces to Redis or Postgres; run the tests in CI; build an evaluation set for briefs; show the conflict and per-agent scores in the UI; and store predictions so confidence can be calibrated.
+Fix company names on the hosted server; move cache, quotas, usage and traces to Redis or Postgres; connect payments so keys are issued automatically; build an evaluation set for briefs; show the conflict and per-agent scores in the UI; and store predictions so confidence can be calibrated.
