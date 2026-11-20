@@ -617,6 +617,25 @@ def _weighted(parts):
     return sum(s * w for s, w in live) / sum(w for _, w in live)
 
 
+# When price behaviour and the business point in opposite directions, the overall
+# score sits near the middle for a reason that a single number hides. Such reports
+# are flagged and their confidence is capped.
+CONFLICT_CONFIDENCE_CAP = 60
+
+
+def assess_conflict(technical_score, fundamental_score):
+    """(conflicted, note). Conflicted when both scores exist and fall on opposite
+    sides of 50; a score of exactly 50 is on neither side."""
+    if technical_score is None or fundamental_score is None:
+        return False, ""
+    t, f = float(technical_score), float(fundamental_score)
+    if (t > 50 and f < 50) or (t < 50 and f > 50):
+        price_side, business_side = ("positive", "negative") if t > 50 else ("negative", "positive")
+        return True, (f"Price evidence is {price_side} ({t:.0f}/100) while the business evidence is "
+                      f"{business_side} ({f:.0f}/100); confidence is capped at {CONFLICT_CONFIDENCE_CAP}%.")
+    return False, ""
+
+
 def build(symbol: str, stock_data: dict, articles: list) -> dict:
     """Runs the full evidence pass for one symbol."""
     bench_symbol, bench_name = benchmark_for(symbol)
@@ -650,6 +669,9 @@ def build(symbol: str, stock_data: dict, articles: list) -> dict:
     agreement = max(0.0, 1 - spread / 30)
     conviction = min(1.0, abs(composite - 50) / 25)
     confidence = int(round(min(92, 30 + 30 * coverage + 20 * agreement + 20 * conviction)))
+    conflicted, conflict_note = assess_conflict(technical_score, fundamental_score)
+    if conflicted:
+        confidence = min(confidence, CONFLICT_CONFIDENCE_CAP)
 
     risk_points = _weighted([(100 - stability.score if stability.score is not None else None, 0.7),
                              (100 - balance.score if balance.score is not None else None, 0.3)])
@@ -701,6 +723,7 @@ def build(symbol: str, stock_data: dict, articles: list) -> dict:
         "market_cap": format_money(stock_data.get("market_cap_raw"), currency) if stock_data.get("market_cap_raw") else None,
         "composite": int(round(composite)), "technical_score": _r(technical_score, 0), "fundamental_score": _r(fundamental_score, 0),
         "bias": bias, "confidence": confidence, "risk": risk,
+        "conflicted": conflicted, "conflict_note": conflict_note,
         "scorecard": scorecard,
         "findings": [{k: v for k, v in f.items() if k != "weight"} for f in findings],
         "strengths": [{k: v for k, v in f.items() if k != "weight"} for f in strengths[:5]],

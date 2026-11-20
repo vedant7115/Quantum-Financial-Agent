@@ -39,36 +39,36 @@ def clean_json_text(text: str) -> str:
         return match.group(1)
     return text
 
-def query_groq(prompt: str, system_prompt: str = None, response_json: bool = True) -> str:
+def query_groq_with_meta(prompt: str, system_prompt: str = None, response_json: bool = True,
+                         request_id: str = "-") -> dict:
     """
-    Directly queries the Groq API via HTTP POST.
-    Sanitizes API keys, enforces 25.0s timeout, supports model fallbacks,
-    and propagates exceptions so the caller can fall back to local rule-based engines.
+    Queries Groq, trying each model in turn until one answers.
+
+    Returns {"content", "model", "usage": {"prompt_tokens", "completion_tokens", "total_tokens"},
+    "attempts": [{"model", "status"}]}. Each model is tried once with a 25-second timeout;
+    any HTTP error (429 rate limit, 400 including Groq's json_validate_failed, 5xx),
+    timeout or network error moves to the next model. If every model fails, the last
+    error is raised so the caller can use its rule-written fallback.
     """
     raw_key = os.getenv("GROQ_API_KEY", "")
     api_key = raw_key.strip().strip("'\"")
     if not api_key:
         raise ValueError("GROQ_API_KEY is not defined in environment variables.")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
     primary_model = os.getenv("GROQ_MODEL", DEFAULT_MODEL).strip().strip("'\"")
-    # Candidate models to try in sequence if one hits rate limits or errors
     candidate_models = [primary_model]
     for fallback_m in FALLBACK_MODELS:
         if fallback_m not in candidate_models:
             candidate_models.append(fallback_m)
 
+    attempts = []
     last_err = None
-
     for model_name in candidate_models:
         payload = {
             "model": model_name,
@@ -84,29 +84,32 @@ def query_groq(prompt: str, system_prompt: str = None, response_json: bool = Tru
 
         try:
             with httpx.Client() as client:
-                response = client.post(
-                    GROQ_URL, 
-                    json=payload, 
-                    headers=headers, 
-                    timeout=25.0
-                )
+                response = client.post(GROQ_URL, json=payload, headers=headers, timeout=25.0)
                 response.raise_for_status()
-                
                 resp_data = response.json()
-                choices = resp_data.get("choices", [])
-                if not choices:
-                    raise ValueError("Groq returned response without choices.")
-                    
-                content = choices[0]["message"]["content"]
-                if response_json:
-                    content = clean_json_text(content)
-                logger.info(f"Groq query succeeded using model: {model_name}")
-                return content
+            choices = resp_data.get("choices", [])
+            if not choices:
+                raise ValueError("Groq returned response without choices.")
+            content = choices[0]["message"]["content"]
+            if response_json:
+                content = clean_json_text(content)
+            raw_usage = resp_data.get("usage") or {}
+            usage = {k: int(raw_usage.get(k) or 0) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
+            attempts.append({"model": model_name, "status": response.status_code})
+            logger.info(f"[{request_id}] Groq ok model={model_name} prompt_tokens={usage['prompt_tokens']} "
+                        f"completion_tokens={usage['completion_tokens']} total_tokens={usage['total_tokens']}")
+            return {"content": content, "model": model_name, "usage": usage, "attempts": attempts}
         except Exception as e:
             last_err = e
             err_body = getattr(e, "response", None)
+            status = err_body.status_code if err_body is not None else type(e).__name__
             err_detail = err_body.text if err_body is not None else ""
-            logger.warning(f"Groq model {model_name} attempt failed: {str(e)} | Details: {err_detail[:200]}")
+            attempts.append({"model": model_name, "status": status})
+            logger.warning(f"[{request_id}] Groq model {model_name} failed ({status}): {str(e)[:120]} | {err_detail[:200]}")
 
     raise last_err
 
+
+def query_groq(prompt: str, system_prompt: str = None, response_json: bool = True) -> str:
+    """The model's text only. Kept for callers that do not need the model name or usage."""
+    return query_groq_with_meta(prompt, system_prompt, response_json)["content"]

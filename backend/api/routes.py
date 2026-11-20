@@ -13,6 +13,7 @@ import time
 import re
 import json
 import math
+import uuid
 from collections import defaultdict
 
 # Load environment variables from .env
@@ -84,7 +85,9 @@ def sanitize_nans(obj):
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_stock(request: AnalyzeRequest, req: Request):
+def analyze_stock(request: AnalyzeRequest, req: Request):
+    # A plain `def`: the pipeline makes blocking calls (yfinance, the sync Groq
+    # client), so FastAPI runs it in its thread pool instead of on the event loop.
     """
     POST /analyze
     Takes a ticker symbol, coordinates the data fetching and multi-agent 
@@ -101,6 +104,8 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         )
 
     start_time = time.perf_counter()
+    # One ID per request, written on every log line for this report and returned as meta.request_id.
+    request_id = uuid.uuid4().hex[:12]
     symbol = request.symbol.upper().strip()
     
     # ── Step 0b: Input Formatting Validation ──
@@ -165,8 +170,13 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     # ── Step 1: Check Cache ──
     cached_result = cache_service.get_from_cache(quota_symbol)
     if cached_result:
-        logger.info(f"Returning cached analysis for symbol: {symbol}")
+        logger.info(f"[{request_id}] cache hit for {quota_symbol}")
         try:
+            meta = cached_result.get("meta") or {}
+            meta["generated_by_request"] = meta.get("request_id")
+            meta["request_id"] = request_id
+            meta["cache"] = "hit"
+            cached_result["meta"] = meta
             cache_info = cache_service.get_cache_info(quota_symbol)
             fallback_active = cached_result.get("final_decision", {}).get("fallback_active", False)
             cached_result["system_status"] = {
@@ -242,10 +252,11 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     try:
         logger.info(f"Running Master Synthesis Agent to aggregate indicators...")
         final_decision = master_agent.analyze(
-            technical_result, 
-            fundamental_result, 
+            technical_result,
+            fundamental_result,
             sentiment_result,
-            research
+            research,
+            request_id=request_id,
         )
         add_to_timeline("Consensus Aggregated")
     except Exception as master_err:
@@ -274,6 +285,22 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
 
     add_to_timeline("Report Dispatched")
 
+    llm_meta = final_decision.pop("llm", {}) or {}
+    meta = {
+        "request_id": request_id,
+        "cache": "miss",
+        "prompt_version": llm_meta.get("prompt_version"),
+        "model": llm_meta.get("model"),
+        "brief_outcome": llm_meta.get("outcome"),
+        "usage": llm_meta.get("usage"),
+        "llm_calls": len(llm_meta.get("attempts", [])),
+        "rejections": llm_meta.get("rejections", []),
+        "generation_time_sec": exec_time,
+    }
+    logger.info(f"[{request_id}] report {resolved_symbol} done in {exec_time}s composite={research['composite']} "
+                f"conflicted={research.get('conflicted')} model={meta['model']} outcome={meta['brief_outcome']} "
+                f"prompt_version={meta['prompt_version']} total_tokens={(meta['usage'] or {}).get('total_tokens')}")
+
     response_data = {
         "stock": resolved_symbol,
         "current_price": stock_data["price"],
@@ -285,7 +312,8 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
         "final_decision": final_decision,
         "system_status": system_status,
         "timeline": timeline,
-        "insight": research
+        "insight": research,
+        "meta": meta,
     }
     
     # Sanitize all NaN/Inf floats before caching and returning

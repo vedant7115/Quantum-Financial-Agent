@@ -4,23 +4,74 @@
 # The stance, confidence and risk level are calculated in research_engine.py and
 # are final. The language model's only job is to explain them: it receives the
 # findings with their numbers and may not introduce figures, dates or events of
-# its own. If the model is unavailable, or its answer fails the checks below, a
-# plain rule-written version of the same evidence is used instead.
+# its own. Its answer must match the Brief schema below and pass two checks
+# (no advice wording, no numbers missing from the evidence). A failed answer is
+# retried once with the reason attached; if that also fails, or no model is
+# available, a plain rule-written version of the same evidence is used instead.
 
-import json
 import logging
 import os
 import re
+from typing import List, Literal
 
-from services.llm_service import query_groq
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator
+from typing_extensions import Annotated
+
+from services.llm_service import query_groq_with_meta
 
 logger = logging.getLogger("quantum_agent.master_agent")
+
+# Bump this whenever the prompt text or the expected JSON shape changes. It is
+# logged and returned with every report so a brief can be traced to its prompt.
+PROMPT_VERSION = "v2.0"
 
 ADVICE_PATTERN = re.compile(
     r"\b(strong buy|buy rating|sell rating|we recommend|should (buy|sell|hold)|"
     r"(buy|sell|accumulate|exit) (the stock|now|this stock)|target price|price target of)\b", re.I)
 
 RISK_CATEGORIES = ["Valuation risk", "Market risk", "Business risk", "Financial risk", "News and event risk"]
+
+Line = Annotated[str, StringConstraints(strip_whitespace=True, min_length=5, max_length=600)]
+Level = Literal["Low", "Medium", "High"]
+
+
+class RiskItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    category: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=60)]
+    severity: Level
+    probability: Level
+    explanation: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=600)]
+
+
+class Brief(BaseModel):
+    """The shape the model must return. Anything else is rejected."""
+    model_config = ConfigDict(extra="ignore")
+    summary: Annotated[str, StringConstraints(strip_whitespace=True, min_length=80, max_length=3000)]
+    key_drivers: List[Line] = Field(min_length=2, max_length=6)
+    bull_case: List[Line] = Field(min_length=2, max_length=5)
+    bear_case: List[Line] = Field(min_length=2, max_length=5)
+    risk_register: List[RiskItem] = Field(min_length=1, max_length=6)
+
+    @field_validator("key_drivers", "bull_case", "bear_case", mode="before")
+    @classmethod
+    def one_point_per_item(cls, value):
+        """Some models put several points in one string separated by line breaks.
+        Split those into separate items; the wording itself is not changed."""
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return value
+        items = []
+        for item in value:
+            if isinstance(item, str):
+                items.extend(p.strip(" -*•\t") for p in item.splitlines() if p.strip(" -*•\t"))
+            else:
+                items.append(item)
+        return items
+
+
+class BriefRejected(ValueError):
+    """The model answered in the right shape, but the answer broke a rule."""
 
 
 def _numbers(text: str) -> set:
@@ -44,6 +95,19 @@ def _unsupported_numbers(text: str, allowed: set) -> list:
             continue
         bad.append(n)
     return bad
+
+
+def check_brief(text: str, evidence: str) -> Brief:
+    """Parses and checks a model answer. Raises ValidationError (bad JSON or wrong
+    shape) or BriefRejected (advice wording, or numbers not in the evidence)."""
+    brief = Brief.model_validate_json(text)
+    written = brief.model_dump_json()
+    if ADVICE_PATTERN.search(written):
+        raise BriefRejected("contains investment advice wording")
+    stray = _unsupported_numbers(written, _numbers(evidence))
+    if len(stray) > 2:
+        raise BriefRejected(f"contains numbers not in the evidence: {sorted(stray)[:6]}")
+    return brief
 
 
 def _evidence_text(research: dict, sentiment: dict) -> str:
@@ -70,6 +134,10 @@ def _evidence_text(research: dict, sentiment: dict) -> str:
     if fund:
         lines.append(f"[Reported figures, {fund['period_label']}]")
         lines.append("  " + "; ".join(f"{m['label']} {m['value']}" for m in fund["metrics"]))
+    if research.get("conflicted"):
+        lines.append("[Conflict]")
+        lines.append(f"  Price score {research['technical_score']}/100, business score {research['fundamental_score']}/100: "
+                     "they point in opposite directions.")
     heads = sentiment.get("positive_drivers", []) + sentiment.get("negative_drivers", [])
     if heads:
         lines.append("[Recent headlines]")
@@ -87,6 +155,8 @@ def _rule_view(research: dict, sentiment: dict) -> dict:
         parts.append("In its favour: " + "; ".join(s["title"] for s in strengths[:3]) + ".")
     if concerns:
         parts.append("Against it: " + "; ".join(c["title"] for c in concerns[:3]) + ".")
+    if research.get("conflicted"):
+        parts.append(research["conflict_note"])
     if not research["coverage"]["financials"]:
         parts.append("Company financials could not be retrieved, so this view rests on price behaviour and news only.")
 
@@ -99,9 +169,9 @@ def _rule_view(research: dict, sentiment: dict) -> dict:
         s = 100 - score if invert else score
         return "High" if s >= 65 else ("Medium" if s >= 40 else "Low")
 
-    for category, key, text in (
-        ("Valuation risk", "valuation", "valuation"), ("Market risk", "stability", "stability"),
-        ("Business risk", "growth", "growth"), ("Financial risk", "balance", "balance"),
+    for category, key in (
+        ("Valuation risk", "valuation"), ("Market risk", "stability"),
+        ("Business risk", "growth"), ("Financial risk", "balance"),
     ):
         pillar = by_pillar[key]
         if pillar["score"] is None:
@@ -124,21 +194,32 @@ def _rule_view(research: dict, sentiment: dict) -> dict:
     }
 
 
-def analyze(technical: dict, fundamental: dict, sentiment: dict, research: dict) -> dict:
-    view = _rule_view(research, sentiment)
-    fallback_active = True
-
-    if os.getenv("GROQ_API_KEY"):
-        evidence = _evidence_text(research, sentiment)
-        stance = {"Bullish": "leans positive", "Bearish": "leans negative", "Neutral": "is mixed"}[research["bias"]]
-        prompt = f"""You are writing an equity research brief for a retail investor about {research.get('name')}.
+def _prompt(research: dict, evidence: str) -> str:
+    stance = {"Bullish": "leans positive", "Bearish": "leans negative", "Neutral": "is mixed"}[research["bias"]]
+    conflict = ""
+    if research.get("conflicted"):
+        conflict = ("\nThe price evidence and the business evidence point in opposite directions; "
+                    "make that tension the centre of the second paragraph of the summary.")
+    schema = (
+        '{\n'
+        '  "summary": "Two short paragraphs separated by \\n\\n. First: what the evidence says overall and the two or '
+        'three facts that matter most, with their numbers. Second: the main tension or uncertainty in the picture. '
+        'Do not mention the historical record in the summary; it may be used in the cases below.",\n'
+        '  "key_drivers": ["3 to 5 separate strings, each a short phrase naming one fact that drives the view, with its number"],\n'
+        '  "bull_case": ["3 or 4 separate strings, one sentence each: the strongest honest argument for the stock, each tied to a number above"],\n'
+        '  "bear_case": ["3 or 4 separate strings, one sentence each: the strongest honest argument against it, each tied to a number above"],\n'
+        f'  "risk_register": [{{"category": "one of {RISK_CATEGORIES}", "severity": "Low|Medium|High", '
+        '"probability": "Low|Medium|High", "explanation": "one sentence grounded in the evidence"}]\n'
+        '}'
+    )
+    return f"""You are writing an equity research brief for a retail investor about {research.get('name')}.
 All analysis below was calculated from market data and the company's reported financial statements.
 
 EVIDENCE
 {evidence}
 
 CALCULATED RESULT (final, do not change): the evidence {stance}; overall {research['composite']}/100;
-confidence {research['confidence']}%; risk level {research['risk']}.
+confidence {research['confidence']}%; risk level {research['risk']}.{conflict}
 
 RULES
 - Use ONLY the evidence above. Every number you write must appear in the evidence exactly.
@@ -149,42 +230,76 @@ RULES
 - If a pillar was not assessed, say so rather than guessing.
 
 Return ONLY a JSON object:
-{{
-  "summary": "Two short paragraphs separated by \\n\\n. First: what the evidence says overall and the two or three facts that matter most, with their numbers. Second: the main tension or uncertainty in the picture. Do not mention the historical record in the summary; it may be used in the cases below.",
-  "key_drivers": ["3 to 5 short phrases naming the facts that drive the view, each with its number"],
-  "bull_case": ["3 or 4 sentences. The strongest honest argument for the stock, each tied to a number above"],
-  "bear_case": ["3 or 4 sentences. The strongest honest argument against it, each tied to a number above"],
-  "risk_register": [{{"category": "one of {RISK_CATEGORIES}", "severity": "Low|Medium|High", "probability": "Low|Medium|High", "explanation": "one sentence grounded in the evidence"}}]
-}}
+{schema}
 Give 3 to 5 risk_register entries, only for risks the evidence supports."""
-        try:
-            llm = json.loads(query_groq(prompt))
-            written = json.dumps(llm, ensure_ascii=False)
-            if ADVICE_PATTERN.search(written):
-                raise ValueError("model output contained investment advice wording")
-            stray = _unsupported_numbers(written, _numbers(evidence))
-            if len(stray) > 2:
-                raise ValueError(f"model output contained numbers not in the evidence: {sorted(stray)[:6]}")
+
+
+def analyze(technical: dict, fundamental: dict, sentiment: dict, research: dict, request_id: str = "-") -> dict:
+    """The final decision. Bias, confidence and risk come from research; the model
+    only writes the text. The returned "llm" block (prompt version, model, token
+    usage, attempts, outcome, rejection reasons) is logged and sent to the client."""
+    view = _rule_view(research, sentiment)
+    llm_meta = {"prompt_version": PROMPT_VERSION, "model": None, "outcome": "rule",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "attempts": [], "rejections": []}
+
+    if os.getenv("GROQ_API_KEY"):
+        evidence = _evidence_text(research, sentiment)
+        prompt = _prompt(research, evidence)
+        # One retry: if an answer fails validation, ask once more with the reason
+        # attached. A transport failure is not retried here, because
+        # query_groq_with_meta has already tried every model in the chain.
+        for attempt in range(2):
+            text = prompt
+            if attempt:
+                text += (f"\n\nYour previous answer was rejected: {llm_meta['rejections'][-1]}. "
+                         "Return a corrected JSON object that follows every rule.")
+            try:
+                result = query_groq_with_meta(text, request_id=request_id)
+            except Exception as err:
+                llm_meta["rejections"].append(f"no model answered: {str(err)[:160]}")
+                break
+            for key in llm_meta["usage"]:
+                llm_meta["usage"][key] += result["usage"].get(key, 0)
+            llm_meta["attempts"].extend(result["attempts"])
+            llm_meta["model"] = result["model"]
+            try:
+                brief = check_brief(result["content"], evidence)
+            except ValidationError as err:
+                errors = err.errors()
+                first = errors[0] if errors else {}
+                where = ".".join(str(x) for x in first.get("loc", ())) or "JSON"
+                llm_meta["rejections"].append(f"invalid output at {where}: {first.get('msg', 'parse error')}")
+                continue
+            except BriefRejected as err:
+                llm_meta["rejections"].append(str(err))
+                continue
+            data = brief.model_dump()
             for field in ("summary", "key_drivers", "bull_case", "bear_case", "risk_register"):
-                value = llm.get(field)
-                if value and isinstance(value, type(view[field])):
-                    view[field] = value
-            fallback_active = False
-        except Exception as err:
-            logger.warning(f"Synthesis model rejected or unavailable ({err}); using the rule-written view.")
+                view[field] = data[field]
+            llm_meta["outcome"] = "ai" if attempt == 0 else "ai_after_retry"
+            break
+
+    logger.info(f"[{request_id}] brief prompt_version={PROMPT_VERSION} outcome={llm_meta['outcome']} "
+                f"model={llm_meta['model']} prompt_tokens={llm_meta['usage']['prompt_tokens']} "
+                f"completion_tokens={llm_meta['usage']['completion_tokens']} "
+                f"total_tokens={llm_meta['usage']['total_tokens']} calls={len(llm_meta['attempts'])} "
+                f"rejections={llm_meta['rejections']}")
 
     return {
         "market_bias": research["bias"],
         "confidence": research["confidence"],
         "risk": research["risk"],
+        "conflicted": bool(research.get("conflicted")),
         "key_drivers": view["key_drivers"],
         "watchlist_factors": research["watch"],
         "potential_risks": view["potential_risks"],
         "future_catalysts": view["future_catalysts"],
         "summary": view["summary"],
-        "fallback_active": fallback_active,
+        "fallback_active": llm_meta["outcome"] == "rule",
         "bull_case": view["bull_case"],
         "bear_case": view["bear_case"],
         "risk_register": view["risk_register"],
         "catalyst_calendar": research["calendar"],
+        "llm": llm_meta,
     }

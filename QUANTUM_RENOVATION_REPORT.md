@@ -2,6 +2,14 @@
 
 Written 2026-11-20 from the code on `main` (tag `v2.0.0`, commit `b4cbcf4`). v1 means commit `9b4a208`, the last commit before the renovation.
 
+**Update, 2026-11-20 (later):** six hardening changes were added after the v2.0.0 release. They are marked **(added after v2.0.0)** below and are on the `feat/monetization-foundation` branch. Until they are merged to `main` they are **not deployed**.
+1. `analyze_stock` is a plain `def` (runs in FastAPI's thread pool); the cache has a `threading.Lock`.
+2. `PROMPT_VERSION = "v2.0"`, logged and returned with the model used.
+3. Groq token usage, model and a per-request `request_id` are logged for every report.
+4. The LLM's JSON is validated with a Pydantic model, retried once, then falls back to the rule-written brief.
+5. An explicit `conflicted` flag caps confidence at 60 when technical and fundamental scores fall on opposite sides of 50.
+6. `backend/test_verification.py` works again; 9 pytest tests were added (6 for the engine).
+
 Every item carries one label:
 
 - **VERIFIED IN CODE**: present in the code, with file and function cited, and it runs.
@@ -35,7 +43,7 @@ Numbers marked *measured* come from the benchmark in section 2.4. They were run 
 
 ### 2.1 Model chain
 
-**VERIFIED IN CODE**: `backend/services/llm_service.py`, `query_groq()`; `backend/agents/master_agent.py`, `analyze()`.
+**VERIFIED IN CODE**: `backend/services/llm_service.py`, `query_groq_with_meta()`; `backend/agents/master_agent.py`, `analyze()` and `check_brief()`.
 
 The chain, in order:
 
@@ -48,19 +56,24 @@ The chain, in order:
 
 Models are de-duplicated, so if `GROQ_MODEL` is one of the three it is not tried twice (`FALLBACK_MODELS`).
 
-**What counts as a failure in `query_groq()`.** Any exception inside the `try` moves to the next model:
+**What counts as a failure in `query_groq_with_meta()`.** Any exception inside the `try` moves to the next model:
 - HTTP error status via `raise_for_status()`: 429 rate limit, 400 (including Groq's own `json_validate_failed`, because `response_format: json_object` is set), 404 model not found, 5xx.
 - Timeout: `timeout=25.0` seconds per model (httpx raises).
 - Network errors.
 - A response with no `choices`.
 
-**What sends a report straight to the rule-written brief in `master_agent.analyze()`.** These do **not** try the next model:
-- `json.loads` fails on the returned text.
-- The text matches `ADVICE_PATTERN` ("we recommend", "target price", "should buy" and similar).
-- More than 2 numbers in the text are not found in the evidence (`_unsupported_numbers()`).
-- All models raised.
+Each attempt's model and HTTP status are recorded in `attempts`.
 
-**Retries and backoff: NOT IMPLEMENTED.** Each model is tried exactly once. There is no retry on the same model, no exponential backoff, and the `retry-after` header is not read. The worst case is three timeouts, about 75 seconds, which is longer than the frontend's 45-second axios timeout (`frontend/src/api.js`). In that case the user sees an error even though the backend would eventually answer with the rule-written brief.
+**What happens to an answer that arrives (added after v2.0.0).** `check_brief()` in `master_agent.py` validates it. The answer is rejected if:
+- it is not valid JSON, or does not match the Pydantic `Brief` model (`ValidationError`). The model requires a summary of 80–3,000 characters, 2–6 key drivers, 2–5 bull and bear points, and 1–6 risk items whose severity and probability are each `Low`, `Medium` or `High`;
+- it matches `ADVICE_PATTERN` ("we recommend", "target price", "should buy" and similar) (`BriefRejected`);
+- more than 2 of its numbers are not found in the evidence (`_unsupported_numbers()`, `BriefRejected`).
+
+A rejected answer is **retried once**: the same prompt is sent again with the rejection reason appended, through the full model chain. If the second answer is also rejected, the rule-written brief is used. A transport failure (every model raised) is not retried, because the whole chain was already tried.
+
+Before validation, a list item that contains line breaks is split into separate items (`Brief.one_point_per_item`); the wording is not changed. This was added after testing showed `gpt-oss-20b` packing four bull-case sentences into one string.
+
+**Backoff: NOT IMPLEMENTED.** There is no delay between attempts, no exponential backoff, and the `retry-after` header is not read. The worst case is two rounds of three timeouts, about 150 seconds, far longer than the frontend's 45-second axios timeout (`frontend/src/api.js`). In that case the user sees an error even though the backend would eventually answer with the rule-written brief. In practice timeouts have not been observed; answers take 2–4 seconds.
 
 ### 2.2 Ollama, local models, routing
 
@@ -100,6 +113,7 @@ What this does and does not show:
 - The AI call itself took 2.3 – 2.8 s in v2; the rest of each report is data fetching.
 - An earlier test (2026-11-17) on six stocks gave v2 1,844 – 2,322 tokens per brief, and a burst of nine reports with no pauses all received an AI brief: five from 120b, then the rest via fallback after 120b returned 429.
 - Live on Render (2026-11-17): 4.8 s and 7.2 s for two reports.
+- **After the hardening changes** (local, 2026-11-20, gpt-oss-120b, through the API): four fresh reports used 1,958 – 2,443 tokens and took 7.0 – 11.2 s; all four were accepted on the first attempt. A retry, when it happens, roughly doubles the tokens for that report (about 4,000 – 4,800), still under one model's 8,000-a-minute limit.
 
 ---
 
@@ -190,9 +204,14 @@ confidence = min(92, 30 + 30 × coverage + 20 × agreement + 20 × conviction)
 coverage   = scored pillars / 8
 agreement  = max(0, 1 − std_dev(pillar scores excluding stability) / 30)
 conviction = min(1, |composite − 50| / 25)
+if conflicted: confidence = min(confidence, 60)
 ```
 
-- **Disagreement lowers confidence: VERIFIED IN CODE,** but at **pillar** level (spread of the seven pillar scores), not as an explicit agent-versus-agent vote. There is no rule such as "technical bullish and fundamental bearish → flag conflict".
+- **Disagreement lowers confidence: VERIFIED IN CODE,** in two ways:
+  - Pillar level: the agreement term falls as the seven pillar scores spread apart.
+  - **Technical vs fundamental (added after v2.0.0):** `research_engine.assess_conflict()` sets `conflicted = true` when both scores exist and fall on opposite sides of 50 (a score of exactly 50 is on neither side). Confidence is then capped at `CONFLICT_CONFIDENCE_CAP = 60`, a `conflict_note` explains it, the prompt tells the model to make the tension the centre of the summary's second paragraph, and the rule-written brief includes the note. The flag is returned as `insight.conflicted` and `final_decision.conflicted`. The bias label is not changed.
+  - In local tests on 2026-11-20 the flag fired for Infosys and TCS (weak price, strong business) and not for Apple or Tesla.
+  - **Not done:** the frontend does not display the flag yet; it only appears in the summary text and the API response. The rule uses no dead-band, so scores of 51 and 49 count as a conflict.
 - **Missing or failed part: VERIFIED IN CODE.** Weights re-normalise, coverage lowers confidence, the agent reports "Unavailable", and the response carries `insight.coverage` (`prices`, `financials`, `headlines`, `benchmark`, `earnings_date`). The UI shows coverage in the method note.
 - **Exception:** if price history itself fails (fewer than 30 closes), the whole request fails with HTTP 500. There is no partial report without prices.
 - **Calibration: NOT IMPLEMENTED.** Confidence is a hand-set heuristic; it has never been tested against outcomes. Weights and thresholds are judgement, not fitted. The historical base rates are descriptive statistics shown to the user; they do not adjust the score.
@@ -205,22 +224,24 @@ conviction = min(1, |composite − 50| / 25)
 
 | Check | Status | Where |
 | :-- | :-- | :-- |
-| JSON mode requested from Groq | VERIFIED IN CODE | `query_groq()`, `response_format: json_object` |
+| JSON mode requested from Groq | VERIFIED IN CODE | `query_groq_with_meta()`, `response_format: json_object` |
 | Markdown fences stripped, outer `{...}` extracted | VERIFIED IN CODE | `clean_json_text()` |
-| Parse with `json.loads`, fall back to rules on failure | VERIFIED IN CODE | `master_agent.analyze()` |
-| Advice wording blocked | VERIFIED IN CODE | `ADVICE_PATTERN` |
+| Pydantic schema for the LLM output (added after v2.0.0) | VERIFIED IN CODE | `Brief` and `RiskItem` in `master_agent.py`, parsed with `Brief.model_validate_json()` in `check_brief()`; lengths, list sizes and `Low/Medium/High` enforced; unknown fields ignored |
+| Advice wording blocked | VERIFIED IN CODE | `ADVICE_PATTERN` in `check_brief()` |
 | Numbers not in the evidence blocked (more than 2 → reject) | VERIFIED IN CODE | `_unsupported_numbers()`, ±1% or ±0.6 tolerance; numbers ≤12 and 14/50/52/100/200 ignored |
-| Per-field type check before use | PARTIAL | `isinstance(value, type(view[field]))`; checks list vs string only |
-| Pydantic schema for the LLM output | NOT IMPLEMENTED | `risk_register` items, severity values and list lengths are not validated |
-| Retry with a corrective prompt | NOT IMPLEMENTED | |
-| Pydantic on the API response | VERIFIED IN CODE | `AnalyzeResponse` in `backend/models/schemas.py`; `insight` and `access` are untyped `Dict[str, Any]` |
+| Retry once with the rejection reason (added after v2.0.0) | VERIFIED IN CODE | loop in `master_agent.analyze()`; outcome recorded as `ai`, `ai_after_retry` or `rule` |
+| Fall back to the rule-written brief | VERIFIED IN CODE | `_rule_view()` |
+| Risk-register category limited to the five named categories | NOT IMPLEMENTED | Any 3–60 character string is accepted |
+| Pydantic on the API response | VERIFIED IN CODE | `AnalyzeResponse` in `backend/models/schemas.py`; `insight`, `access` and `meta` are untyped `Dict[str, Any]` |
+| Tests | VERIFIED IN CODE | `backend/tests/test_master_brief.py`: valid answer accepted; non-JSON, bad severity, advice wording and invented numbers rejected; invalid-then-valid accepted on retry; invalid twice falls back to rules |
 
 ### 5.2 Concurrency
 
 - **Agent calls are not concurrent, and do not need to be.** The three agents run one after another in `routes.analyze_stock()`, but they are pure Python over already-fetched data and take milliseconds.
 - **Data fetches are parallel: VERIFIED IN CODE.** `research_engine.build()` runs four yfinance fetches (5-year history, benchmark history, statements, calendar) in a `ThreadPoolExecutor(max_workers=4)`. The quote and news fetches before it are sequential.
-- **The endpoint blocks the event loop. Known problem.** `analyze_stock` is `async def` but calls synchronous yfinance, `httpx.Client` (sync) and `ThreadPoolExecutor.result()` directly. No `asyncio.gather`, no `run_in_threadpool`, no async HTTP client. With one uvicorn worker (`main.py`, no `workers` setting), one slow report stalls every other request on that server for 5–10 seconds.
-- **Fix (not done):** make the handler `def` (FastAPI then runs it in a thread pool), or wrap the pipeline in `run_in_threadpool`, and switch to `httpx.AsyncClient`.
+- **The endpoint no longer blocks the event loop (added after v2.0.0). VERIFIED IN CODE.** `analyze_stock` in `routes.py` is now a plain `def`, so FastAPI runs each request in its worker thread pool (AnyIO's default limit is 40 threads). Tested locally: two simultaneous fresh reports finished in 9.5 s together, against about 17.5 s one after the other.
+- **Still synchronous inside.** The pipeline uses blocking yfinance calls and a sync `httpx.Client`. There is no `asyncio.gather` and no `httpx.AsyncClient`; concurrency comes from threads, not async I/O. One uvicorn worker process (`main.py`).
+- **Other in-memory state touched by those threads:** the quota store uses `threading.Lock()` (`billing_service._usage_lock`). The per-client rate limiter (`routes.is_rate_limited`, `_rate_limits`) has **no lock**; under concurrent requests from the same client its count can be slightly off. NOT FIXED.
 
 ### 5.3 Cache
 
@@ -230,7 +251,10 @@ conviction = min(1, |composite − 50| / 25)
 - **Key:** the resolved symbol, for example `RELIANCE.NS`. Not keyed by plan; plan locks are applied after the cache read (`billing_service.apply_entitlements()`), so one cached report serves all plans correctly.
 - **TTL:** 900 seconds by default, env `CACHE_TTL_SECONDS` (v1 was 60 seconds).
 - **Tiered TTLs: NOT IMPLEMENTED.** One TTL for everything.
-- **Locking: NOT IMPLEMENTED in the cache.** There is no lock. It is safe today only because the handler runs on the single event-loop thread (see 5.2). If the handler is moved to a thread pool, the check-then-delete in `get_from_cache()` can race. Two simultaneous requests for the same uncached stock both compute it (no request coalescing).
+- **Locking (added after v2.0.0): VERIFIED IN CODE.** A module-level `threading.Lock` (`_lock`) is held for every read, write, clear and TTL check. That makes each operation atomic, including the expire-and-delete inside `get_from_cache()`.
+- **Private copies:** `get_from_cache()` returns `copy.deepcopy()` of the stored report, so the route can edit `system_status`, `timeline` and `meta` on a cache hit without changing what other requests receive.
+- **Not done:** two simultaneous requests for the same uncached stock both compute it (no request coalescing or per-key lock).
+- Tested in `backend/tests/test_cache_service.py`: copies are independent, 8 threads × 200 mixed operations raise no errors, and expired entries return `None`.
 - The quota store in `billing_service.py` **does** use `threading.Lock()` (`_usage_lock`).
 - **Multiple instances:** each instance has its own cache and quota counts, and both are lost on restart. A shared store (Redis or Postgres) is needed before scaling out.
 
@@ -240,15 +264,17 @@ conviction = min(1, |composite − 50| / 25)
 
 | Item | Status | Detail |
 | :-- | :-- | :-- |
-| Prompt storage | PARTIAL | One prompt, an f-string inside `master_agent.analyze()`. Versioned only by git history |
-| Prompt version IDs (v2, v2.1) | NOT IMPLEMENTED | No version constant; nothing logged per report |
-| Model used per report | PARTIAL | Logged as `Groq query succeeded using model: …` (`query_groq()`); not returned in the API response |
-| Token and usage tracking | NOT IMPLEMENTED | Groq returns `usage`; the code ignores it. Token figures in this report come from an external benchmark script |
-| Request ID across agents | NOT IMPLEMENTED | No correlation ID; logs are joined by symbol and timestamp only |
-| Structured logs | PARTIAL | Python `logging` to stdout and a rotating file (`routes.py`), plain text, not JSON |
+| Prompt storage | PARTIAL | One prompt, built by `master_agent._prompt()` in code. Not in a separate file or prompt registry |
+| Prompt version (added after v2.0.0) | VERIFIED IN CODE | `PROMPT_VERSION = "v2.0"` in `master_agent.py`; written in the brief log line and returned as `meta.prompt_version`. It is a manual constant: someone must bump it (for example to `v2.1`) when the prompt changes. Nothing enforces that |
+| Model used per report (added after v2.0.0) | VERIFIED IN CODE | Returned as `meta.model`, with `meta.llm_calls` and `meta.brief_outcome` (`ai`, `ai_after_retry`, `rule`) and `meta.rejections` |
+| Token and usage tracking (added after v2.0.0) | PARTIAL | Groq's `usage` (prompt, completion, total tokens) is parsed in `query_groq_with_meta()`, summed across a retry in `master_agent.analyze()`, logged and returned as `meta.usage`. **Logged only:** not stored in a database, no daily totals, no dashboard or alert |
+| Request ID (added after v2.0.0) | VERIFIED IN CODE | `routes.analyze_stock()` creates a 12-character `request_id` (from `uuid4`). It prefixes the cache-hit, Groq, brief and report-done log lines and is returned as `meta.request_id`. On a cache hit, `meta.generated_by_request` names the request that produced the report |
+| Cross-agent tracing | PARTIAL | The ID is passed to the master agent and the Groq client only. The three sub-agents do not log, so they are not traced; no OpenTelemetry or tracing backend |
+| Structured logs | PARTIAL | Plain-text `key=value` lines to stdout and a rotating file (`routes.py`), not JSON |
 | Quality evaluation | NOT IMPLEMENTED | No eval set, no grading of briefs, no backtest of scores |
-| Automated tests | NOT IMPLEMENTED | No pytest or unittest files. `backend/test_verification.py` is a manual script and is **broken in v2**: it calls the v1 agent signatures and fails with `KeyError: 'price'` |
-| Guardrails on output | VERIFIED IN CODE | Advice regex and number check (section 5.1) |
+| Automated tests (added after v2.0.0) | VERIFIED IN CODE | 9 pytest tests in `backend/tests/`, all offline, passing in about 1 s: 6 for the engine (`test_research_engine.py`), 2 for brief validation and retry (`test_master_brief.py`), 1 for the cache (`test_cache_service.py`). Run with `python -m pytest tests` from `backend/`; `pytest` is in `backend/requirements-dev.txt`. **No CI runs them** |
+| Manual end-to-end script (fixed after v2.0.0) | VERIFIED IN CODE | `backend/test_verification.py` now runs the v2 pipeline for AAPL and INFY against live data and exits non-zero on failure |
+| Guardrails on output | VERIFIED IN CODE | Pydantic schema, advice regex and number check (section 5.1) |
 
 ---
 
@@ -320,9 +346,9 @@ conviction = min(1, |composite − 50| / 25)
 
 1. No user accounts, no database, no payments. Paid keys are issued by hand with `scripts/issue_access_key.py`.
 2. Quotas, rate limits and cache live in memory: reset on restart, wrong with more than one instance.
-3. The analyze endpoint blocks the event loop (section 5.2).
-4. No retries or backoff; worst-case LLM wait (~75 s) exceeds the frontend timeout (45 s).
-5. No token tracking, prompt versioning, request IDs, evaluation or automated tests. The one test script is broken.
+3. The pipeline is synchronous code run in threads, not async I/O; the per-client rate limiter has no lock (section 5.2).
+4. No backoff; worst-case LLM wait (about 150 s with the retry) exceeds the frontend timeout (45 s).
+5. Token usage is logged but not stored or totalled; the prompt version is a manual constant; sub-agents are not traced; no evaluation set; the tests do not run in CI. The hardening changes are not deployed until merged to `main`.
 6. Confidence and weights are not calibrated or backtested.
 7. Valuation uses absolute thresholds, not sector-relative ones.
 8. Sentiment is a keyword lexicon; it still misses some headlines ("get out of Nvidia").
@@ -348,8 +374,9 @@ Each line is supported by the code; numbers are from the code or the measured be
 - Cut LLM usage by 72–76% (about 8,400 to 2,000–2,350 tokens per report, measured) against the multi-call agent configuration by moving sub-agents to rule-based scoring, capping output at 1,600 tokens and lowering reasoning effort.
 - Fixed production data failures: fundamentals now come from reported statements instead of a source that failed on Render, non-existent tickers return 400 instead of random data, and catalyst dates come from the exchange calendar instead of the model.
 - Shipped v2.0.0 to Render and Vercel with Free / ₹149 / ₹499 plans enforced server-side (daily quotas, HMAC-signed access keys) and a redesigned React 19 + Recharts report with shareable URLs.
+- Hardened the LLM layer with Pydantic validation of model output, one corrective retry and a rule-based fallback, plus per-request IDs, prompt versioning and token-usage logging; covered the engine, validation and cache with 9 offline pytest tests. *(Use this line only after the hardening changes are merged to `main`.)*
 
-**Do not write:** "multi-agent LLM system", "LangChain", "async/concurrent agents", "Docker", "calibrated confidence", "backtested", "Redis", "production-grade observability", or any latency improvement over v1's default setting.
+**Do not write:** "multi-agent LLM system", "LangChain", "fully async", "Docker", "calibrated confidence", "backtested", "Redis", "distributed tracing", "production-grade observability", "CI/CD test pipeline", or any latency improvement over v1's default setting.
 
 ---
 
@@ -362,13 +389,13 @@ Not in the autonomous sense. In v2 they are deterministic modules: each reads th
 Every score is a sum of fixed checks, each with a stated threshold and the figure it used (`Pillar.add()` in `research_engine.py`). Same inputs give the same score. What I cannot claim is that the weights are optimal: they are judgement, not fitted or backtested.
 
 **3. How do you stop the LLM from hallucinating?**
-Three layers in `master_agent.py`: the prompt contains only the calculated evidence and forbids outside facts; the output is rejected if it contains advice wording (`ADVICE_PATTERN`); and it is rejected if more than two numbers in it are not in the evidence (`_unsupported_numbers()`). A rejected brief is replaced by a rule-written one, so the user always gets a report. The check catches invented numbers, not invented qualitative claims.
+Three layers in `master_agent.py`: the prompt contains only the calculated evidence and forbids outside facts; the output is rejected if it contains advice wording (`ADVICE_PATTERN`); and it is rejected if more than two numbers in it are not in the evidence (`_unsupported_numbers()`). Before those checks the answer must parse into a Pydantic `Brief` model (lengths, list sizes, `Low/Medium/High` levels). A rejected answer is retried once with the reason attached; if it fails again, a rule-written brief is used, so the user always gets a report. The checks catch invented numbers and malformed output, not invented qualitative claims.
 
 **4. Walk me through what happens when Groq rate-limits you.**
-`query_groq()` catches the 429 and immediately tries the next model: gpt-oss-120b, then gpt-oss-20b, then qwen3.8-27b, each with its own per-minute allowance. If all fail, the rule-written brief is used. There is no retry or backoff, and I do not read the rate-limit headers, so it is reactive. In a local burst test of nine reports with no pause, all nine got an AI brief through the chain.
+`query_groq_with_meta()` catches the 429 and immediately tries the next model: gpt-oss-120b, then gpt-oss-20b, then qwen3.8-27b, each with its own per-minute allowance. If all fail, the rule-written brief is used. There is no backoff and I do not read the rate-limit headers, so it is reactive; the one retry in the master agent is for rejected answers, not for rate limits. In a local burst test of nine reports with no pause, all nine got an AI brief through the chain.
 
 **5. Is your FastAPI endpoint actually asynchronous?**
-No, and that is the main technical debt. It is declared `async def` but calls blocking yfinance and a sync httpx client, so with one worker a 5–10 second report blocks other requests. The fix is to declare it `def` so FastAPI uses its thread pool, or use `run_in_threadpool` and `httpx.AsyncClient`. Inside the pipeline, the four slow data fetches do run in parallel threads.
+Not async, but no longer blocking. It used to be `async def` while calling blocking yfinance and a sync httpx client, which stalled every other request. I changed it to a plain `def`, so FastAPI runs it in its thread pool; two simultaneous reports now take 9.5 s together instead of about 17.5 s. A full async rewrite (`httpx.AsyncClient`, async data access) would scale further, but yfinance is synchronous, so threads are the practical choice. Inside each request, the four slow data fetches also run in parallel threads.
 
 **6. How does the consensus handle missing data?**
 `_weighted()` drops any part with no score and re-normalises the remaining weights. Confidence has a coverage term (scored pillars out of eight), so partial data lowers it, and the response includes a `coverage` object. One gap: if price history fails entirely the request returns 500 rather than a partial report.
@@ -377,10 +404,16 @@ No, and that is the main technical debt. It is declared `async def` but calls bl
 `30 + 30 × coverage + 20 × agreement + 20 × conviction`, capped at 92, where agreement falls as pillar scores spread apart and conviction rises as the composite moves away from 50. It is not calibrated: I have not checked that "80% confidence" reports are right more often than "60%" ones. That would need stored predictions and outcomes.
 
 **8. Your cache is a dict. Is it thread-safe? What happens with two servers?**
-There is no lock. It is safe today only because the handler runs on the single event-loop thread. If I move the handler to a thread pool I need a lock or a proper store. With two instances each has its own cache and quota counts, and both reset on restart; the answer is Redis or Postgres.
+Since the handler moved to the thread pool, every cache operation holds a `threading.Lock`, and reads return a deep copy so one request cannot change another's report. A test runs 8 threads against it. Two gaps remain: two requests for the same uncached stock both compute it, and with two instances each has its own cache and quota counts, both reset on restart. The answer to the second is Redis or Postgres.
 
 **9. How did you cut token use, and what does a report cost?**
 By default v1 already made one call (sub-agent calls were behind a flag); with the flag on it made four. I removed the sub-agent LLM code entirely, set `reasoning_effort` to low and capped output at 1,600 tokens. Measured: about 8,400 tokens per report with v1's four calls, about 2,000–2,350 in v2. Against v1's default single call, v2 uses about the same; the gain there is that the output is checked and cannot change the scores. At Groq's free tier the cost is zero but capacity is about 9–10 fresh reports a minute; repeat views are served from a 15-minute cache.
 
 **10. What would you do next?**
-In order: make the endpoint non-blocking; move quotas and cache to Postgres or Redis with user accounts; log tokens, model and a prompt version with a request ID for every report; add pytest coverage for the engine's checks and a small evaluation set for the brief; and store each report's score so confidence can be calibrated against what the stock actually did.
+In order: move quotas, cache and the token logs to Postgres or Redis with user accounts; run the tests in CI; build a small evaluation set for the brief; show the conflict flag in the UI; and store each report's score so confidence can be calibrated against what the stock actually did.
+
+**11. How do you know which prompt and model produced a given report?**
+Every response carries `meta`: `request_id`, `prompt_version`, `model`, token `usage`, `llm_calls`, `brief_outcome` and any rejection reasons, and the same request ID prefixes the log lines for that report. The limits: the prompt version is a constant I bump by hand, and the usage is only logged, not stored.
+
+**12. What happens when technical and fundamental analysis disagree?**
+`assess_conflict()` flags the report when the two scores fall on opposite sides of 50, caps confidence at 60, and the brief is told to explain the tension. In testing it fired for Infosys and TCS: weak price trend, strong business. The bias label is not changed, and the flag is not yet shown as a badge in the UI.
