@@ -26,6 +26,7 @@ function errorMessage(err) {
   const detail = err?.response?.data?.detail;
   if (detail === "INVALID_TICKER") return { title: "We could not find that ticker.", body: "Check the symbol and try again. Indian stocks use their NSE symbol, such as RELIANCE or TCS." };
   if (detail === "DATA_UNAVAILABLE") return { title: "Market data is unavailable right now.", body: "The data provider did not answer for this stock. Try again in a minute." };
+  if (detail === "INSUFFICIENT_HISTORY") return { title: "This stock is too new to assess.", body: "It has fewer than 30 trading days of prices, which the price checks need. Try again once it has traded longer." };
   if (status === 429) return { title: "That was a lot of requests.", body: "Wait a minute, then try again." };
   if (!err?.response) return { title: "The research engine is waking up.", body: "It sleeps when idle and takes up to a minute to start. Try again shortly." };
   return { title: "Something went wrong.", body: "The report could not be produced. Try again." };

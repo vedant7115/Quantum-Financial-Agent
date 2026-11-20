@@ -1,301 +1,211 @@
 # routes.py
-# This file defines the FastAPI routes and wires them to the analytical pipeline.
-# Includes structured logging, validation error handlers, and dotenv reading.
+# HTTP routes. The analysis itself lives in services/pipeline.py.
+#
+# /analyze is async end to end: blocking work runs in worker threads
+# (asyncio.to_thread), the agents fan out with asyncio.gather, and identical
+# concurrent requests share one computation through the tiered cache.
 
-from fastapi import APIRouter, HTTPException, Depends, Request
-from models.schemas import AnalyzeRequest, AnalyzeResponse
-from agents import technical_agent, fundamental_agent, sentiment_agent, master_agent
-from services import stock_service, news_service, cache_service, billing_service, research_engine
-import logging
-import os
-from dotenv import load_dotenv
-import time
-import re
+import asyncio
 import json
+import logging
 import math
+import os
+import re
+import threading
+import time
 from collections import defaultdict
 
-# Load environment variables from .env
+from dotenv import load_dotenv
+from fastapi import APIRouter, HTTPException, Request
+
+import prompts
+from core.context import (Trace, new_request_id, prompt_version_var, request_id_var, trace_var, traces)
+from core.logging_setup import configure_logging
+from models.schemas import AnalyzeRequest, AnalyzeResponse
+from services import billing_service, cache_service, llm_service, pipeline, stock_service, usage_service
+from services.cache_service import cache
+
 load_dotenv()
-
-from logging.handlers import RotatingFileHandler
-
-# Setup logging
-log_handlers = [logging.StreamHandler()]
-try:
-    log_file = os.getenv("LOG_FILE", "quantum_system.log")
-    log_handlers.append(RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"))
-except Exception:
-    pass
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=log_handlers
-)
+configure_logging()
 logger = logging.getLogger("quantum_agent.api")
 
-# In-memory IP rate limiter state
+# ── Per-client rate limit (sliding window, in memory) ─────────────────────────
 _rate_limits = defaultdict(list)
+_rate_lock = threading.Lock()
 
-def is_rate_limited(ip: str, limit: int = 5, window: int = 60) -> bool:
-    """Allows up to 'limit' requests per 'window' seconds from a single IP."""
+
+def is_rate_limited(client_id: str, limit: int = 5, window: int = 60) -> bool:
+    """Allows up to `limit` requests per `window` seconds from one client."""
     now = time.time()
-    # Keep only timestamps within the sliding window
-    _rate_limits[ip] = [t for t in _rate_limits[ip] if now - t < window]
-    if len(_rate_limits[ip]) >= limit:
-        return True
-    _rate_limits[ip].append(now)
-    return False
+    with _rate_lock:
+        recent = [t for t in _rate_limits[client_id] if now - t < window]
+        if len(recent) >= limit:
+            _rate_limits[client_id] = recent
+            return True
+        recent.append(now)
+        _rate_limits[client_id] = recent
+        return False
+
 
 def is_valid_symbol_format(symbol: str) -> bool:
-    """Checks for standard equity tickers (1-15 Alphanumerics, optional NSE dot or suffix)."""
+    """Equity tickers: 1-15 letters, digits, dots or dashes (RELIANCE.NS, BRK-B)."""
     return bool(re.match(r"^[A-Z0-9\.\-]{1,15}$", symbol))
 
-# Demo Mode Setup
+
+# ── Demo mode ─────────────────────────────────────────────────────────────────
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 DEMO_REPORTS = {}
-
 if DEMO_MODE:
     try:
         demo_path = os.path.join(os.path.dirname(__file__), "..", "config", "demo_reports.json")
-        if os.path.exists(demo_path):
-            with open(demo_path, "r", encoding="utf-8") as f:
-                DEMO_REPORTS = json.load(f)
-            logger.info(f"DEMO_MODE active. Loaded {len(DEMO_REPORTS)} demo reports from cache.")
-        else:
-            logger.warning(f"DEMO_MODE is active but demo_reports.json was not found at {demo_path}")
+        with open(demo_path, "r", encoding="utf-8") as f:
+            DEMO_REPORTS = json.load(f)
+        logger.info(f"DEMO_MODE active. Loaded {len(DEMO_REPORTS)} demo reports.")
     except Exception as demo_err:
-        logger.error(f"Error loading demo_reports.json in API initialization: {str(demo_err)}")
+        logger.error(f"Could not load demo_reports.json: {demo_err}")
 
 router = APIRouter()
 
+
 def sanitize_nans(obj):
-    """Recursively replace NaN/Infinity float values with 0 or None for JSON safety."""
+    """Recursively replace NaN/Infinity floats with 0.0 for JSON safety."""
     if isinstance(obj, dict):
         return {k: sanitize_nans(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         return [sanitize_nans(i) for i in obj]
-    elif isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return 0.0
     return obj
+
+
+def _require_admin(req: Request):
+    token = os.getenv("ADMIN_TOKEN", "").strip()
+    if not token or req.headers.get("x-admin-token", "") != token:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+
+def _timeline(spans: list, started_at: float) -> list:
+    """The older timeline field, derived from the trace spans."""
+    out = [{"timestamp": time.strftime("%H:%M:%S", time.localtime(started_at)), "event": "Request Received"}]
+    for s in spans:
+        if s["name"].startswith("llm."):
+            continue
+        out.append({"timestamp": time.strftime("%H:%M:%S", time.localtime(started_at + s["end_ms"] / 1000)),
+                    "event": f"{s['name']} ({s['status']}, {s['duration_ms']:.0f} ms)"})
+    return out
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_stock(request: AnalyzeRequest, req: Request):
     """
     POST /analyze
-    Takes a ticker symbol, coordinates the data fetching and multi-agent 
-    analysis flow, aggregates signals through the Master Agent, and returns the analysis.
+    quote -> technical | fundamental | sentiment (concurrent) -> consensus -> brief.
     """
-    # ── Step 0a: Rate Limiting Safety Check ──
     access = billing_service.resolve_access(req)
-    client_ip = billing_service.client_ip(req)
     if is_rate_limited(access["client_id"], limit=10, window=60):
-        logger.warning(f"Rate limit exceeded for client IP: {client_ip}")
-        raise HTTPException(
-            status_code=429,
-            detail="RATE_LIMIT_EXCEEDED"
-        )
+        logger.warning(f"Rate limit exceeded for {billing_service.client_ip(req)}")
+        raise HTTPException(status_code=429, detail="RATE_LIMIT_EXCEEDED")
 
-    start_time = time.perf_counter()
     symbol = request.symbol.upper().strip()
-    
-    # ── Step 0b: Input Formatting Validation ──
     if not symbol:
         raise HTTPException(status_code=400, detail="Stock ticker symbol cannot be empty")
-        
     if not is_valid_symbol_format(symbol):
-        logger.warning(f"Invalid stock ticker symbol format: {symbol}")
         raise HTTPException(status_code=400, detail="INVALID_TICKER")
 
-    # ── Step 0b2: Plan quota ──
-    # Checked against the resolved symbol so "RELIANCE" and "RELIANCE.NS" count once.
-    quota_symbol = stock_service.resolve_symbol(symbol)
-    if not billing_service.can_analyze(access, quota_symbol):
-        logger.info(f"Daily quota reached for {access['client_id']} on plan {access['plan']['id']}")
-        raise HTTPException(
-            status_code=402,
-            detail={"code": "QUOTA_EXCEEDED", **billing_service.access_summary(access)},
-        )
+    loop = asyncio.get_running_loop()
+    request_started = loop.time()
+    request_id = new_request_id()
+    version = prompts.active_version()
+    trace = Trace(request_id, symbol, version)
+    tokens = (request_id_var.set(request_id), prompt_version_var.set(version), trace_var.set(trace))
+    usage_service.record_report("requests")
 
-    def deliver(report: dict) -> dict:
-        """Counts the report against the caller's quota and applies plan locks."""
-        billing_service.record_analysis(access, quota_symbol)
-        return billing_service.apply_entitlements(report, access)
+    try:
+        # Resolve and validate together: a bare Indian symbol falls back to .NS, then .BO.
+        with trace.span("validate") as sp:
+            resolved, source = await cache.get_or_compute(
+                "price", f"resolve:{symbol}", lambda: asyncio.to_thread(stock_service.resolve_and_validate, symbol))
+            sp.update(cache=source, resolved=resolved)
+        if not resolved:
+            raise HTTPException(status_code=400, detail="INVALID_TICKER")
+        trace.symbol = resolved
 
-    # ── Step 0c: Demo Mode Check ──
-    if DEMO_MODE and symbol in DEMO_REPORTS:
-        logger.info(f"DEMO_MODE active: serving pre-cached report for {symbol} instantly.")
-        demo_report = json.loads(json.dumps(DEMO_REPORTS[symbol])) # deep copy
-        now_time = time.time()
-        
-        # Override timestamps dynamically for smooth frontend animation
-        demo_report["timeline"] = [
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time)), "event": "Request Received"},
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time + 0.05)), "event": "Market Data Ingested (Demo)"},
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time + 0.1)), "event": "Technical Intel Generated (Demo)"},
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time + 0.15)), "event": "Fundamental Intel Generated (Demo)"},
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time + 0.2)), "event": "Sentiment Intel Generated (Demo)"},
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time + 0.25)), "event": "Consensus Aggregated (Demo)"},
-            {"timestamp": time.strftime("%H:%M:%S", time.localtime(now_time + 0.3)), "event": "Report Dispatched"}
-        ]
-        if "system_status" in demo_report:
-            demo_report["system_status"]["execution_time_sec"] = 0.3
-            demo_report["system_status"]["cache_status"] = "Demo Hit"
-        return deliver(demo_report)
+        # Quota is counted against the resolved symbol, so "RELIANCE" and "RELIANCE.NS" count once.
+        if not billing_service.can_analyze(access, resolved):
+            raise HTTPException(status_code=402, detail={"code": "QUOTA_EXCEEDED", **billing_service.access_summary(access)})
 
-    # ── Step 0d: Live Ticker Existence Check ──
-    # Check if symbol actually exists on yfinance before doing expensive queries
-    if not stock_service.is_ticker_valid(symbol):
-        logger.warning(f"Ticker validation failed: Ticker {symbol} does not exist.")
-        raise HTTPException(status_code=400, detail="INVALID_TICKER")
+        def deliver(report: dict) -> dict:
+            billing_service.record_analysis(access, resolved)
+            return billing_service.apply_entitlements(report, access)
 
-    timeline = []
-    
-    def add_to_timeline(event: str):
-        current_time_str = time.strftime("%H:%M:%S", time.localtime())
-        timeline.append({"timestamp": current_time_str, "event": event})
-        
-    add_to_timeline("Request Received")
-    logger.info(f"Received analysis request for symbol: {symbol}")
-    
-    # ── Step 1: Check Cache ──
-    cached_result = cache_service.get_from_cache(quota_symbol)
-    if cached_result:
-        logger.info(f"Returning cached analysis for symbol: {symbol}")
+        if DEMO_MODE and symbol in DEMO_REPORTS:
+            demo = json.loads(json.dumps(DEMO_REPORTS[symbol]))
+            demo.setdefault("system_status", {})["cache_status"] = "Demo Hit"
+            return deliver(demo)
+
         try:
-            cache_info = cache_service.get_cache_info(quota_symbol)
-            fallback_active = cached_result.get("final_decision", {}).get("fallback_active", False)
-            cached_result["system_status"] = {
-                "backend_status": "Online",
-                "groq_status": "Fallback Mode" if fallback_active else ("Online" if os.getenv("GROQ_API_KEY") else "Offline"),
-                "yfinance_status": "Online",
-                "news_status": "Online",
-                "cache_status": "Hit",
-                "cache_ttl_sec": cache_info["ttl_remaining"],
-                "execution_time_sec": round(time.perf_counter() - start_time, 3)
-            }
-            
-            # Append cache-specific timeline stages
-            cached_result["timeline"] = [
-                {"timestamp": time.strftime("%H:%M:%S", time.localtime(time.time() - 0.05)), "event": "Request Received"},
-                {"timestamp": time.strftime("%H:%M:%S", time.localtime(time.time())), "event": "Cached Report Retrieved"},
-                {"timestamp": time.strftime("%H:%M:%S", time.localtime(time.time())), "event": "Report Dispatched"}
-            ]
-            return deliver(cached_result)
-        except Exception as cache_err:
-            logger.warning(f"Cached schema mismatch for {symbol}. Recalculating. Error: {str(cache_err)}")
-            cache_service.clear_cache()
-            
-    # ── Step 2: Fetch Real-Time Market and News Data ──
-    logger.info(f"Fetching market data and historical timeframes for {symbol}...")
-    try:
-        resolved_symbol = stock_service.resolve_symbol(symbol)
-        
-        # Sequentially fetch datasets
-        stock_data = stock_service.get_stock_data(resolved_symbol)
-        news_data = news_service.get_news(resolved_symbol, stock_data.get("name", ""))
-        # Evidence pass: five years of prices, the benchmark and reported statements.
-        research = research_engine.build(resolved_symbol, stock_data, news_data.get("articles", []))
-        
-        add_to_timeline("Market Data Ingested")
-        logger.info(f"Successfully retrieved data. Executing analysis pipeline...")
-        
-    except stock_service.MarketDataUnavailable as data_err:
-        logger.error(f"Market data unavailable for {symbol}: {str(data_err)}")
-        raise HTTPException(status_code=502, detail="DATA_UNAVAILABLE")
-    except Exception as data_err:
-        logger.error(f"Data acquisition failure for {symbol}: {str(data_err)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Data pipeline failure for {symbol}: {str(data_err)}"
-        )
-        
-    # ── Step 3: Run Sub-Agent Analyses ──
-    try:
-        # Technical Agent (assesses multi-timeframe closes)
-        logger.info(f"Running Technical Analysis Agent for {resolved_symbol}...")
-        technical_result = technical_agent.analyze(stock_data, research)
-        add_to_timeline("Technical Intel Generated")
-        
-        # Fundamental Agent (assesses earnings, margins, valuation)
-        logger.info(f"Running Fundamental Analysis Agent for {resolved_symbol}...")
-        fundamental_result = fundamental_agent.analyze(stock_data, research)
-        add_to_timeline("Fundamental Intel Generated")
-        
-        # Sentiment Agent (assesses recent news headlines)
-        logger.info(f"Running Sentiment Analysis Agent for {resolved_symbol}...")
-        sentiment_result = sentiment_agent.analyze(news_data)
-        add_to_timeline("Sentiment Intel Generated")
-        
-    except Exception as agent_err:
-        logger.error(f"Analytical sub-agent failure for {resolved_symbol}: {str(agent_err)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Analytical sub-agent failure: {str(agent_err)}"
-        )
-        
-    # ── Step 4: Run Master Agent synthesis ──
-    try:
-        logger.info(f"Running Master Synthesis Agent to aggregate indicators...")
-        final_decision = master_agent.analyze(
-            technical_result, 
-            fundamental_result, 
-            sentiment_result,
-            research
-        )
-        add_to_timeline("Consensus Aggregated")
-    except Exception as master_err:
-        logger.error(f"Master Agent synthesis failure for {resolved_symbol}: {str(master_err)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Master Agent synthesis failure: {str(master_err)}"
-        )
-        
-    # ── Step 5: Format and Cache Response ──
-    # Attach raw articles to sentiment result for frontend News Insights presentation
-    sentiment_result["articles"] = news_data.get("articles", [])
+            with trace.span("report") as sp:
+                report, source = await cache.get_or_compute(
+                    "report", resolved, lambda: pipeline.build_report(resolved, request_started))
+                sp.update(cache=source)
+        except stock_service.MarketDataUnavailable as err:
+            logger.error(f"Market data unavailable for {resolved}: {err}")
+            raise HTTPException(status_code=502, detail="DATA_UNAVAILABLE")
+        except pipeline.InsufficientHistory as err:
+            # Very new listings: fewer daily closes than the price checks need.
+            logger.warning(f"Not enough price history for {resolved}: {err}")
+            raise HTTPException(status_code=422, detail="INSUFFICIENT_HISTORY")
 
-    fallback_active = final_decision.get("fallback_active", False)
-    exec_time = round(time.perf_counter() - start_time, 3)
+        if source == "hit":
+            usage_service.record_report("cache_hits")
+        elif source == "coalesced":
+            usage_service.record_report("coalesced")
 
-    system_status = {
-        "backend_status": "Online",
-        "groq_status": "Fallback Mode" if fallback_active else ("Online" if os.getenv("GROQ_API_KEY") else "Offline"),
-        "yfinance_status": "Online",
-        "news_status": "Online",
-        "cache_status": "Miss",
-        "cache_ttl_sec": cache_service.CACHE_TTL,
-        "execution_time_sec": exec_time
-    }
+        generated = report.pop("generated", {}) or {}
+        exec_time = round(loop.time() - request_started, 3)
+        llm = report.get("llm") or {}
+        fallback_active = report["final_decision"].get("fallback_active", False)
+        trace.attrs.update({"cache": source, "generated_by_request": generated.get("request_id")})
+        trace_dict = trace.to_dict()
+        if source != "miss":
+            # The spans that built the report belong to the request that generated it.
+            trace_dict["generation_spans"] = generated.get("spans", [])
 
-    add_to_timeline("Report Dispatched")
-
-    response_data = {
-        "stock": resolved_symbol,
-        "current_price": stock_data["price"],
-        "change_pct": stock_data["change_pct"],
-        "market_state": stock_data.get("market_state", ""),
-        "technical": technical_result,
-        "fundamental": fundamental_result,
-        "sentiment": sentiment_result,
-        "final_decision": final_decision,
-        "system_status": system_status,
-        "timeline": timeline,
-        "insight": research
-    }
-    
-    # Sanitize all NaN/Inf floats before caching and returning
-    response_data = sanitize_nans(response_data)
-    
-    # Store in cache
-    cache_service.set_in_cache(resolved_symbol, response_data)
-    logger.info(f"Completed analysis and cached response for {resolved_symbol}")
-
-    return deliver(response_data)
+        report["system_status"] = {
+            "backend_status": "Online",
+            "groq_status": "Fallback Mode" if fallback_active else ("Online" if os.getenv("GROQ_API_KEY") else "Offline"),
+            "yfinance_status": "Online",
+            "news_status": "Online",
+            "cache_status": {"hit": "Hit", "coalesced": "Coalesced", "miss": "Miss"}[source],
+            "cache_ttl_sec": cache.ttl_remaining("report", resolved) if source != "miss" else cache.ttls["report"],
+            "execution_time_sec": exec_time,
+        }
+        report["timeline"] = _timeline(trace_dict["spans"], trace.started_at)
+        report["meta"] = {
+            "request_id": request_id,
+            "prompt_version": llm.get("prompt_version", version),
+            "cache": source,
+            "generated_by_request": generated.get("request_id"),
+            "execution_time_sec": exec_time,
+        }
+        report["trace"] = trace_dict
+        report = sanitize_nans(report)
+        logger.info("report", extra={"event": {
+            "type": "report", "symbol": resolved, "cache": source, "execution_ms": round(exec_time * 1000, 1),
+            "composite": report["insight"]["composite"], "conflicted": report["insight"].get("conflicted"),
+            "model": llm.get("model"), "outcome": llm.get("outcome"),
+            "total_tokens": (llm.get("tokens") or {}).get("total")}})
+        return deliver(report)
+    except HTTPException:
+        raise
+    except Exception as err:
+        usage_service.record_report("errors")
+        logger.exception(f"Analysis failed for {symbol}")
+        raise HTTPException(status_code=500, detail=f"Analysis failure for {symbol}: {err}")
+    finally:
+        traces.add(trace.to_dict())
+        for var, token in zip((request_id_var, prompt_version_var, trace_var), tokens):
+            var.reset(token)
 
 
 @router.get("/plans")
@@ -312,97 +222,92 @@ async def get_usage(req: Request):
 
 @router.get("/health")
 async def health_check():
-    """
-    GET /health
-    Pings backend server status and verifies environment.
-    """
-    groq_loaded = "GROQ_API_KEY" in os.environ and bool(os.environ["GROQ_API_KEY"].strip())
-    gemini_loaded = "GEMINI_API_KEY" in os.environ and bool(os.environ["GEMINI_API_KEY"].strip())
+    """GET /health — liveness and configuration flags."""
+    groq_loaded = bool(os.environ.get("GROQ_API_KEY", "").strip())
+    gemini_loaded = bool(os.environ.get("GEMINI_API_KEY", "").strip())
     return {
         "status": "ok",
         "message": "QUANTUM AGENT Backend is fully operational",
         "environment": {
             "groq_api_key_configured": groq_loaded,
-            "gemini_api_key_configured": gemini_loaded
-        }
+            "gemini_api_key_configured": gemini_loaded,
+            "prompt_version": prompts.active_version(),
+        },
     }
+
 
 @router.get("/stock/{symbol}")
 async def get_stock_info(symbol: str):
-    """
-    GET /stock/{symbol}
-    Returns raw ticker metrics and multiple historical timeframe closes.
-    """
-    resolved_symbol = stock_service.resolve_symbol(symbol)
+    """GET /stock/{symbol} — raw quote metrics and several historical timeframes."""
+    resolved = await asyncio.to_thread(stock_service.resolve_symbol, symbol)
     try:
-        stock_data = stock_service.get_stock_data(resolved_symbol)
-        timeframe_data = stock_service.get_multiple_timeframes(resolved_symbol)
-        return sanitize_nans({
-            "stock": stock_data,
-            "timeframes": timeframe_data
-        })
+        stock_data, timeframe_data = await asyncio.gather(
+            asyncio.to_thread(stock_service.get_stock_data, resolved),
+            asyncio.to_thread(stock_service.get_multiple_timeframes, resolved))
+        return sanitize_nans({"stock": stock_data, "timeframes": timeframe_data})
     except stock_service.MarketDataUnavailable:
         raise HTTPException(status_code=502, detail="DATA_UNAVAILABLE")
     except Exception as e:
-        logger.error(f"Error fetching stock info for {resolved_symbol}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch stock detail for {resolved_symbol}: {str(e)}"
-        )
+        logger.error(f"Error fetching stock info for {resolved}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch stock detail for {resolved}: {e}")
+
+
+def _live_price(resolved: str) -> dict:
+    import yfinance as yf
+    fi = yf.Ticker(resolved, session=stock_service._yf_session).fast_info
+    last_price = getattr(fi, "last_price", None)
+    prev_close = getattr(fi, "previous_close", None)
+    if not last_price:
+        raise ValueError("fast_info returned no price")
+    last_price = float(last_price)
+    prev_close = float(prev_close) if prev_close else last_price
+    change = last_price - prev_close
+    return {
+        "symbol": resolved,
+        "price": round(last_price, 2),
+        "change": round(change, 2),
+        "change_pct": round((change / prev_close * 100) if prev_close else 0.0, 2),
+        "previous_close": round(prev_close, 2),
+        "market_cap": getattr(fi, "market_cap", None),
+        "source": "Yahoo Finance fast_info (live)",
+    }
 
 
 @router.get("/price/{symbol}")
 async def get_live_price(symbol: str):
-    """
-    GET /price/{symbol}
-    Lightweight, cache-bypassing endpoint that returns the live price
-    in ~1 second using fast_info. Ideal for real-time UI polling.
-    """
-    import yfinance as yf
-    resolved_symbol = stock_service.resolve_symbol(symbol.upper().strip())
+    """GET /price/{symbol} — live price from fast_info, bypassing the cache."""
+    resolved = await asyncio.to_thread(stock_service.resolve_symbol, symbol.upper().strip())
     try:
-        ticker = yf.Ticker(resolved_symbol, session=stock_service._yf_session)
-        fi = ticker.fast_info
-        last_price    = getattr(fi, "last_price", None)
-        prev_close    = getattr(fi, "previous_close", None)
-        market_cap    = getattr(fi, "market_cap", None)
-
-        if not last_price:
-            raise ValueError("fast_info returned no price")
-
-        last_price = float(last_price)
-        prev_close = float(prev_close) if prev_close else last_price
-        change     = last_price - prev_close
-        change_pct = (change / prev_close * 100) if prev_close else 0.0
-
-        return sanitize_nans({
-            "symbol": resolved_symbol,
-            "price": round(last_price, 2),
-            "change": round(change, 2),
-            "change_pct": round(change_pct, 2),
-            "previous_close": round(prev_close, 2),
-            "market_cap": market_cap,
-            "source": "Yahoo Finance fast_info (live)"
-        })
+        return sanitize_nans(await asyncio.to_thread(_live_price, resolved))
     except Exception as e:
-        logger.error(f"Live price fetch failed for {resolved_symbol}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Live price unavailable for {resolved_symbol}: {str(e)}"
-        )
+        logger.error(f"Live price fetch failed for {resolved}: {e}")
+        raise HTTPException(status_code=500, detail=f"Live price unavailable for {resolved}: {e}")
 
 
 @router.post("/clear-cache")
 async def clear_analysis_cache(req: Request):
-    """
-    POST /clear-cache
-    Flushes all in-memory cached analysis results. Use between demo runs
-    to ensure fresh data without restarting the server.
-    """
-    admin_token = os.getenv("ADMIN_TOKEN", "").strip()
-    if not admin_token or req.headers.get("x-admin-token", "") != admin_token:
-        raise HTTPException(status_code=403, detail="FORBIDDEN")
+    """POST /clear-cache — empties every cache tier. Requires the x-admin-token header."""
+    _require_admin(req)
     cache_service.clear_cache()
     logger.info("Cache cleared via admin endpoint.")
     return {"status": "ok", "message": "Analysis cache cleared. Next requests will fetch fresh data."}
 
+
+@router.get("/admin/traces")
+async def admin_traces(req: Request, limit: int = 50):
+    """GET /admin/traces — the most recent request traces (up to 200 kept). Requires x-admin-token."""
+    _require_admin(req)
+    return {"traces": traces.recent(min(max(limit, 1), 200))}
+
+
+@router.get("/admin/usage")
+async def admin_usage(req: Request):
+    """GET /admin/usage — daily LLM usage, brief outcomes and cache counters. Requires x-admin-token."""
+    _require_admin(req)
+    return {
+        "prompt_version": prompts.active_version(),
+        "model_chain": llm_service.model_chain(),
+        "rate_limits": llm_service.rate_limits.snapshot(),
+        "cache": cache.stats(),
+        **usage_service.snapshot(),
+    }

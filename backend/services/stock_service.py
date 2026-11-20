@@ -54,6 +54,35 @@ INDIAN_TICKERS = {
     "ITC", "LICI", "HINDUNILVR", "LT", "ITC", "BAJFINANCE", "WIPRO"
 }
 
+def format_market_cap(value, currency: str) -> str:
+    if not value:
+        return "N/A"
+    from services.research_engine import format_money
+    return format_money(value, currency or "USD") or "N/A"
+
+
+INDIAN_SUFFIXES = (".NS", ".BO")
+
+
+def resolve_and_validate(symbol: str):
+    """The Yahoo symbol to use, or None if the ticker does not exist.
+
+    A bare symbol is tried as typed first (after the short list of well-known
+    Indian names); if Yahoo has no prices for it, the NSE (.NS) and then BSE
+    (.BO) listings are tried, so any Indian stock can be typed without a suffix."""
+    first = resolve_symbol(symbol)
+    if is_ticker_valid(first):
+        return first
+    if "." in symbol:
+        return None
+    for suffix in INDIAN_SUFFIXES:
+        candidate = f"{symbol.upper().strip()}{suffix}"
+        if candidate != first and is_ticker_valid(candidate):
+            logger.info(f"Resolved {symbol} to the Indian listing {candidate}")
+            return candidate
+    return None
+
+
 def resolve_symbol(symbol: str) -> str:
     """
     Cleans up ticker symbols and appends .NS for popular Indian stocks 
@@ -239,15 +268,8 @@ def get_stock_data(symbol: str) -> dict:
                 currency = getattr(ticker.fast_info, "currency", None)
             except Exception:
                 currency = None
-        if market_cap_raw:
-            if market_cap_raw >= 1e12:
-                market_cap = f"${market_cap_raw / 1e12:.2f}T"
-            elif market_cap_raw >= 1e9:
-                market_cap = f"${market_cap_raw / 1e9:.2f}B"
-            else:
-                market_cap = f"${market_cap_raw / 1e6:.2f}M"
-        else:
-            market_cap = "N/A"
+        # In the listing's own currency: Rs crore / lakh crore for Indian stocks, $B / $T otherwise.
+        market_cap = format_market_cap(market_cap_raw, currency or ("INR" if resolved_symbol.endswith((".NS", ".BO")) else "USD"))
             
         pe_ratio_raw = info.get("trailingPE") or info.get("forwardPE") or 0.0
         pe_ratio = 0.0 if (pe_ratio_raw != pe_ratio_raw) else float(pe_ratio_raw)  # NaN check

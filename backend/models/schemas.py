@@ -84,6 +84,7 @@ class FinalDecision(BaseModel):
     market_bias: str                # "Bullish", "Neutral", "Bearish" (Explainable intelligence)
     confidence: int                 # Weighted consensus score
     risk: str                       # Risk assessment level ("Low", "Medium", "High")
+    conflicted: bool = False        # Price and business scores fall on opposite sides of 50
     key_drivers: List[str]          # Main drivers derived from sub-agents
     watchlist_factors: List[str]    # Pivotal trigger events to track
     summary: str                    # Executive synthesis commentary
@@ -124,4 +125,7 @@ class AnalyzeResponse(BaseModel):
     timeline: List[Dict[str, Any]] = [] # Stage execution timeline logs
     access: Optional[Dict[str, Any]] = None # Caller's plan, locked sections and usage
     insight: Optional[Dict[str, Any]] = None # Calculated evidence: scorecard, findings, base rates, chart
+    meta: Optional[Dict[str, Any]] = None    # request_id, prompt_version, cache source, generating request
+    llm: Optional[Dict[str, Any]] = None     # model, prompt_version, tokens, latency_ms, fallback_used, attempts
+    trace: Optional[Dict[str, Any]] = None   # request_id and timed spans for this request
 
