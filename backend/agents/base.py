@@ -95,7 +95,8 @@ class SentimentAgent(Agent):
 
     async def run(self, evidence: Evidence, ctx: AgentContext) -> AgentResult:
         symbol = evidence.symbol
-        name = evidence.stock_data.get("name", "")
+        # A plain-ticker fallback is not a company name; news then searches by ticker.
+        name = "" if evidence.stock_data.get("name_source") == "ticker" else evidence.stock_data.get("name", "")
         news, _ = await ctx.cache.get_or_compute("news", symbol, lambda: news_service.fetch_news(symbol, name))
         pillar = research_engine._news_pillar(news.get("articles", []))
         status = "ok" if pillar.score is not None else "unavailable"

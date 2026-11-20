@@ -116,11 +116,19 @@ def _from_yahoo(symbol: str) -> list:
     return articles
 
 
+def _rss_query(symbol: str, company_name: str) -> str:
+    """The company name when known; otherwise the ticker plus "stock", and the
+    exchange for Indian listings ("RELIANCE NSE stock")."""
+    if company_name:
+        return f"{company_name} stock"
+    exchange = {"NS": "NSE", "BO": "BSE"}.get(symbol.rsplit(".", 1)[-1]) if "." in symbol else None
+    return " ".join(filter(None, [symbol.split(".")[0], exchange, "stock"]))
+
+
 def _rss_url(symbol: str, company_name: str) -> str:
     india = symbol.endswith((".NS", ".BO"))
-    term = company_name or symbol.split(".")[0]
     locale = "hl=en-IN&gl=IN&ceid=IN:en" if india else "hl=en-US&gl=US&ceid=US:en"
-    return f"https://news.google.com/rss/search?q={quote_plus(term + ' stock')}+when:14d&{locale}"
+    return f"https://news.google.com/rss/search?q={quote_plus(_rss_query(symbol, company_name))}+when:14d&{locale}"
 
 
 def _parse_rss(content: bytes) -> list:
@@ -160,16 +168,9 @@ async def _yahoo_async(symbol: str) -> list:
         return []
 
 
-def select_articles(symbol: str, company_name: str, yahoo: list, rss: list) -> dict:
-    """Merges, filters and orders headlines: Google News is used only when Yahoo has
-    fewer than four; noise and unrelated headlines are dropped; newest first."""
-    articles, source_label = list(yahoo), "Yahoo Finance"
-    if len(articles) < 4 and rss:
-        articles, source_label = articles + rss, ("Yahoo Finance and Google News" if articles else "Google News")
-
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=MAX_AGE_DAYS)
-    terms = _relevant_terms(symbol, company_name)
-    seen, fresh = set(), []
+def _filter(articles: list, terms: list, cutoff, seen: set) -> list:
+    """Drops duplicates, noise, headlines without a relevance term and stale ones."""
+    kept = []
     for a in articles:
         lowered = a["title"].lower()
         key = re.sub(r"[^a-z0-9]", "", lowered)[:60]
@@ -180,7 +181,24 @@ def select_articles(symbol: str, company_name: str, yahoo: list, rss: list) -> d
         if when and when.tzinfo is None:
             when = when.replace(tzinfo=datetime.timezone.utc)
         if when is None or when >= cutoff:
-            fresh.append((when or cutoff, a))
+            kept.append((when or cutoff, a))
+    return kept
+
+
+def select_articles(symbol: str, company_name: str, yahoo: list, rss: list) -> dict:
+    """Merges, filters and orders headlines: Google News is added when fewer than four
+    relevant Yahoo headlines survive the filter; noise and unrelated headlines are
+    dropped; newest first. The ticker is always a relevance term, so this still works
+    when no company name is known."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=MAX_AGE_DAYS)
+    terms = _relevant_terms(symbol, company_name)
+    seen = set()
+    fresh, source_label = _filter(yahoo, terms, cutoff, seen), "Yahoo Finance"
+    if len(fresh) < 4 and rss:
+        from_rss = _filter(rss, terms, cutoff, seen)
+        if from_rss:
+            source_label = "Yahoo Finance and Google News" if fresh else "Google News"
+            fresh += from_rss
     fresh.sort(key=lambda pair: pair[0], reverse=True)
     articles = [a for _, a in fresh[:MAX_ARTICLES]]
 

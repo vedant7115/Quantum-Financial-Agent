@@ -1,5 +1,20 @@
 # Changelog
 
+## Quantum v2.1.1 (on branch `fix/company-name-news`, not deployed yet)
+
+Fixes company names and news on the live site. Scoring formulas, weights and thresholds are unchanged; the response gains one field.
+
+- **What was wrong:** on Render, Yahoo's `quoteSummary` endpoint (what `ticker.info` reads; it needs a cookie and crumb) comes back empty for cloud IPs, while price history, `fast_info` and the statements still work. Evidence from the live AAPL report: `sector` and `industry` were null and there was no earnings date, but market cap and financials were present. The name then fell back to "AAPL Corp.", and the news filter, which needs a word from the name in each headline, kept only headlines containing the literal ticker (1 headline for AAPL).
+- **Company name, layered fallbacks** (`backend/services/company_names.py`):
+  1. `ticker.info`, then the metadata of the price-history call already made (the chart endpoint works from Render);
+  2. Yahoo's search endpoint, exact symbol match only;
+  3. a built-in map of 52 common US and Indian tickers;
+  4. the plain ticker, never "AAPL Corp.".
+- **Name cache:** a found name is cached in the fundamentals tier (24 h); a failed lookup is cached for only 5 minutes.
+- **News:** with no company name, Google News is searched by ticker plus "stock", plus the exchange for Indian listings ("RELIANCE NSE stock"); the ticker is always a relevance term. Google News is now added when fewer than four Yahoo headlines survive the relevance filter (before, it was decided on the unfiltered count). No headlines still means `coverage.headlines = 0` and the news pillar is reweighted, as before.
+- **Response:** `insight.name_source` added (`yahoo_quote`, `yahoo_chart`, `yahoo_search`, `builtin` or `ticker`). Backend version 2.1.1.
+- **Tests:** 11 new offline tests (`tests/test_company_names.py`) for each layer, the all-failed case, the negative cache and the news query and filter; 36 in total.
+
 ## Quantum v2.1.0 (2026-11-20)
 
 Operations release. Scoring formulas, weights and thresholds are unchanged, and the response only gains fields. See `ARCHITECTURE.md` and `QUANTUM_RENOVATION_REPORT.md`.
