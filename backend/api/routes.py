@@ -121,9 +121,13 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
     usage_service.record_report("requests")
 
     try:
-        with trace.span("resolve") as sp:
-            resolved = await asyncio.to_thread(stock_service.resolve_symbol, symbol)
-            sp.update(resolved=resolved)
+        # Resolve and validate together: a bare Indian symbol falls back to .NS, then .BO.
+        with trace.span("validate") as sp:
+            resolved, source = await cache.get_or_compute(
+                "price", f"resolve:{symbol}", lambda: asyncio.to_thread(stock_service.resolve_and_validate, symbol))
+            sp.update(cache=source, resolved=resolved)
+        if not resolved:
+            raise HTTPException(status_code=400, detail="INVALID_TICKER")
         trace.symbol = resolved
 
         # Quota is counted against the resolved symbol, so "RELIANCE" and "RELIANCE.NS" count once.
@@ -139,13 +143,6 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
             demo.setdefault("system_status", {})["cache_status"] = "Demo Hit"
             return deliver(demo)
 
-        with trace.span("validate") as sp:
-            valid, source = await cache.get_or_compute(
-                "price", f"valid:{resolved}", lambda: asyncio.to_thread(stock_service.is_ticker_valid, resolved))
-            sp.update(cache=source, valid=valid)
-        if not valid:
-            raise HTTPException(status_code=400, detail="INVALID_TICKER")
-
         try:
             with trace.span("report") as sp:
                 report, source = await cache.get_or_compute(
@@ -155,8 +152,9 @@ async def analyze_stock(request: AnalyzeRequest, req: Request):
             logger.error(f"Market data unavailable for {resolved}: {err}")
             raise HTTPException(status_code=502, detail="DATA_UNAVAILABLE")
         except pipeline.InsufficientHistory as err:
-            logger.error(f"Not enough price history for {resolved}: {err}")
-            raise HTTPException(status_code=500, detail=f"Data pipeline failure for {resolved}: {err}")
+            # Very new listings: fewer daily closes than the price checks need.
+            logger.warning(f"Not enough price history for {resolved}: {err}")
+            raise HTTPException(status_code=422, detail="INSUFFICIENT_HISTORY")
 
         if source == "hit":
             usage_service.record_report("cache_hits")

@@ -43,7 +43,7 @@ def app(monkeypatch, groq):
         return {"symbol": symbol, "total_articles": 0, "articles": [], "source": "No recent news available"}
 
     monkeypatch.setattr(stock_service, "get_stock_data", fake_quote)
-    monkeypatch.setattr(stock_service, "is_ticker_valid", lambda s: True)
+    monkeypatch.setattr(stock_service, "is_ticker_valid", lambda s: not s.startswith("ZZ"))
     monkeypatch.setattr(research_engine, "_history",
                         lambda s, p: (time.sleep(DELAY), make_prices(0.0012) if not s.startswith("^")
                                       else make_prices(0.0003, seed=3))[1])
@@ -139,3 +139,27 @@ def test_admin_endpoints_require_token_and_expose_traces_and_usage(app):
     assert today["llm_totals"]["total_tokens"] >= 300
     assert body["cache"]["report"]["misses"] >= 1
     assert "openai/gpt-oss-120b" in body["model_chain"] and len(body["model_chain"]) == 3
+
+
+def test_ticker_resolution_and_new_listing_errors(app, monkeypatch):
+    from services import research_engine, stock_service
+
+    # A bare symbol Yahoo does not know falls back to the NSE listing.
+    monkeypatch.setattr(stock_service, "is_ticker_valid", lambda s: s == "TATAMOTORS.NS")
+    assert stock_service.resolve_and_validate("TATAMOTORS") == "TATAMOTORS.NS"
+    assert stock_service.resolve_and_validate("NOPE") is None
+    assert stock_service.format_market_cap(2.5e12, "INR").startswith("₹")
+    assert stock_service.format_market_cap(3.1e12, "USD").startswith("$")
+
+    monkeypatch.setattr(stock_service, "is_ticker_valid", lambda s: not s.startswith("ZZ"))
+    monkeypatch.setattr(research_engine, "_history", lambda s, p: make_prices(0.001, days=20))
+
+    async def run():
+        async with _client(app) as client:
+            fake = await client.post("/api/analyze", json={"symbol": "ZZQQ"}, headers={"x-forwarded-for": "10.0.2.1"})
+            new = await client.post("/api/analyze", json={"symbol": "NEWCO"}, headers={"x-forwarded-for": "10.0.2.2"})
+            return fake, new
+
+    fake, new = asyncio.run(run())
+    assert fake.status_code == 400 and fake.json()["detail"] == "INVALID_TICKER"
+    assert new.status_code == 422 and new.json()["detail"] == "INSUFFICIENT_HISTORY"
