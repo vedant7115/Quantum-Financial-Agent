@@ -1,5 +1,22 @@
 # Changelog
 
+## Quantum v2.1.0 (2026-11-20)
+
+Operations release. Scoring formulas, weights and thresholds are unchanged, and the response only gains fields. See `ARCHITECTURE.md` and `QUANTUM_RENOVATION_REPORT.md`.
+
+- **Async pipeline:** `/api/analyze` no longer blocks the event loop. Groq and Google News use `httpx.AsyncClient`; yfinance and pandas run in `asyncio.to_thread`; independent fetches use `asyncio.gather`.
+- **Agent fan-out:** one `Agent` interface; the technical, fundamental and sentiment agents fetch and compute their evidence concurrently, then the consensus step and the brief.
+- **Tracing:** a `request_id` and timed spans per request, returned as `trace`, logged as JSON, last 200 at `GET /api/admin/traces`.
+- **Prompt versioning:** prompts in `backend/prompts/` (v2.0, v2.1) with a registry and changelog; `PROMPT_VERSION` selects the active one; the version appears in the response, logs and traces.
+- **Usage observability:** tokens, latency, model and fallback step per Groq call; `llm` block in the response; daily aggregates at `GET /api/admin/usage`.
+- **Validated brief:** Pydantic schema, one corrective retry, then the rule-written brief; advice and invented-number guardrails kept.
+- **Retries and deadline:** 429/5xx retried once per model (Retry-After, max 3 s); models near their token limit are skipped and recover after their window; one 30-second LLM deadline inside a 42-second request budget.
+- **Tiered cache:** report 5 min, prices 5 min, news 30 min, fundamentals 24 h; lock, in-flight coalescing, hit/miss counters. The report cache default drops from 15 to 5 minutes.
+- **Conflict flag:** `insight.conflict` when technical and fundamental scores are on opposite sides of 50 and more than 15 points apart; confidence capped at 60; the brief says "Mixed signals". `insight.agent_scores` added.
+- **Tickers:** any Indian stock resolves without a suffix (.NS, then .BO); market cap is shown in the listing's currency; very new listings return 422 `INSUFFICIENT_HISTORY`.
+- **Cleanup:** 17 unused frontend components, the unused OpenRouter client, empty Dockerfiles and the unused `google-generativeai` dependency removed.
+- **Logging and tests:** JSON log lines with `request_id` and `prompt_version`; 24 offline pytest tests (`backend/tests`).
+
 ## Quantum v2.0.0 (2026-11-17)
 
 Version 2 rebuilds how Quantum reaches its conclusions, how it looks, and how it is sold. In version 1 the language model wrote the scores and several report sections, and some of what it showed was invented. In version 2 every score is calculated from market data and the company's reported financial statements, and every claim in a report can be traced to a number.
