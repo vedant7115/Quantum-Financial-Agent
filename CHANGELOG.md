@@ -15,7 +15,13 @@ Operations release. Scoring formulas, weights and thresholds are unchanged, and 
 - **Conflict flag:** `insight.conflict` when technical and fundamental scores are on opposite sides of 50 and more than 15 points apart; confidence capped at 60; the brief says "Mixed signals". `insight.agent_scores` added.
 - **Tickers:** any Indian stock resolves without a suffix (.NS, then .BO); market cap is shown in the listing's currency; very new listings return 422 `INSUFFICIENT_HISTORY`.
 - **Cleanup:** 17 unused frontend components, the unused OpenRouter client, empty Dockerfiles and the unused `google-generativeai` dependency removed.
-- **Logging and tests:** JSON log lines with `request_id` and `prompt_version`; 24 offline pytest tests (`backend/tests`).
+- **Logging and tests:** JSON log lines with `request_id` and `prompt_version`; 25 offline pytest tests (`backend/tests`), run by GitHub Actions on every push and pull request.
+- **Checked before release (local, 2026-11-20):** 25/25 tests pass with no `.env`; US and Indian reports (Indian typed without a suffix) get an AI brief from `gpt-oss-120b` on prompt v2.1; an invalid ticker returns 400; three simultaneous reports for different stocks finish in 7.1 s; two simultaneous requests for one stock compute once (`coalesced: 1`); both admin endpoints return 403 without the right `x-admin-token`.
+
+### Deploying v2.1.0
+
+- **Render:** set `ADMIN_TOKEN` (new) and `ENV=production`; keep `GROQ_API_KEY`, `GROQ_MODEL=openai/gpt-oss-120b` and `ACCESS_KEY_SECRET`. All other new settings have defaults (see `QUANTUM_RENOVATION_REPORT.md`, section 7).
+- **Vercel:** no change.
 
 ## Quantum v2.0.0 (2026-11-17)
 
