@@ -37,7 +37,8 @@ def active_version() -> str:
 
 @lru_cache(maxsize=None)
 def _load(version: str):
-    text = (PROMPT_DIR / PROMPT_VERSIONS[version]).read_text(encoding="utf-8")
+    # Normalise line endings: a Windows checkout may turn the files into CRLF.
+    text = (PROMPT_DIR / PROMPT_VERSIONS[version]).read_text(encoding="utf-8").replace("\r\n", "\n")
     body, _, conflict = text.partition(CONFLICT_MARKER)
     return Template(body), conflict.strip()
 
