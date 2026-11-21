@@ -6,7 +6,7 @@ Updated 2026-11-20. **Deployed:** v2.1.0 is merged into `main` (tag `v2.1.0`) an
 - **v2.0:** tag `v2.0.0`.
 - **v2.1:** tag `v2.1.0`.
 
-**Pending fix (v2.1.1, branch `fix/company-name-news`, not deployed yet):** company names and news on Render, section 3c and gap 13.
+**v2.1.1 (tag `v2.1.1`, deployed and checked live 2026-11-21):** company names and news on Render, section 3c.
 
 The interview study pack is in `INTERVIEW_STUDY_v2.1.md`; the plan for what comes next is in `FUTURE_PLAN.md`.
 
@@ -112,9 +112,9 @@ Called from a laptop over the internet against `quantum-financial-agent.onrender
 - **Admin endpoints live:** `/api/admin/traces` and `/api/admin/usage` return 403 with no token or a wrong token, and 200 with the right `x-admin-token`.
 - **Access keys live:** with a valid Pro key `/api/usage` reports plan `pro`; without one, `free`.
 - **Frontend live:** `quantum-financial-agent.vercel.app/#/s/AAPL` loads a full report with no console errors.
-- **Found live (not caused by v2.1):** on Render, Yahoo does not return company names, so names fall back to "AAPL Corp."; because Google News is searched by name, AAPL got 0 headlines and "News flow: not assessed". The fallback (`stock_service.get_stock_data`, line 251) dates from June 2026. See gap 13. Fixed on branch `fix/company-name-news`, not yet deployed (section 3c).
+- **Found live (not caused by v2.1):** on Render, Yahoo does not return company names, so names fall back to "AAPL Corp."; because Google News is searched by name, AAPL got 0 headlines and "News flow: not assessed". The fallback (`stock_service.get_stock_data`, line 251) dates from June 2026. See gap 13. Fixed in v2.1.1, verified live (section 3c).
 
-### 3c. Company-name and news fix (v2.1.1, local, 2026-11-21, not deployed)
+### 3c. Company-name and news fix (v2.1.1, 2026-11-21, live)
 
 **Root cause (from the live AAPL report):** `sector` and `industry` null, no earnings date, name "AAPL Corp.", but market cap and financials present. So Yahoo's `quoteSummary` endpoint (`ticker.info`, crumb-authenticated) returns nothing for Render's cloud IP, while the chart, `fast_info` and statements endpoints work. Not a full rate limit, and not a missing field: an empty info dict. Yahoo's news endpoint was also failing during testing, locally too (yfinance reports "Yahoo Finance is currently down").
 
@@ -128,7 +128,19 @@ Called from a laptop over the internet against `quantum-financial-agent.onrender
 | RELIANCE → .NS | Reliance Industries Limited | same, `yahoo_chart` | same, `builtin` | 10 | Good (70) |
 | TCS → .NS | Tata Consultancy Services Limited | same, `yahoo_chart` | same, `builtin` | 10 | Soft (35) |
 
-Headline counts and pillars were the same in all three modes. Also checked: the search layer returns "Palantir Technologies Inc." for PLTR, and ticker-only news finds 10 headlines for "PLTR stock" and 7 for "IRFC NSE stock". The Render-like modes are simulated by patching yfinance locally; **not yet verified on Render**.
+Headline counts and pillars were the same in all three modes. Also checked: the search layer returns "Palantir Technologies Inc." for PLTR, and ticker-only news finds 10 headlines for "PLTR stock" and 7 for "IRFC NSE stock". The Render-like modes are simulated by patching yfinance locally.
+
+**Live on Render after deploying v2.1.1 (2026-11-21):** `/` reports version 2.1.1.
+
+| Ticker | Live name | `name_source` | Headlines (v2.1.0 → v2.1.1) | News pillar | Brief |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| AAPL | Apple Inc. | `yahoo_chart` | 1 → 5 | Mixed (40) | AI, `gpt-oss-120b` |
+| RELIANCE → .NS | Reliance Industries Limited | `yahoo_chart` | → 6 | Mixed (58) | AI, `gpt-oss-120b` |
+| KO | The Coca-Cola Company | `yahoo_chart` | → 7 | Mixed (43) | AI, `gpt-oss-120b` |
+| MSFT (`/api/stock`) | Microsoft Corporation | `yahoo_chart` | not run | | |
+| TCS.NS (`/api/stock`) | Tata Consultancy Services Limited | `yahoo_chart` | not run | | |
+
+Every live name came from the price-history metadata and `sector` was still null, which confirms the root cause: `ticker.info` is empty on Render. The frontend at `#/s/AAPL` shows "Apple Inc." with no console errors.
 
 ---
 
@@ -234,7 +246,7 @@ Headline counts and pillars were the same in all three modes. Also checked: the 
 | 10c. Market cap in the listing currency | VERIFIED IN CODE | `stock_service.format_market_cap`. Live: Asian Paints "₹2.50 lakh Cr" (was "$…") |
 | 11. Dead code | VERIFIED IN CODE | Removed 17 unused frontend components, 2 unused stylesheets, `base_agent.py` (OpenRouter), empty Dockerfiles and `docker-compose.yml`, and `google-generativeai`. `vite build` passes |
 | 11b. Working Dockerfile | NOT IMPLEMENTED | Deleted instead, as the brief allowed |
-| 13. Company names and news on Render | VERIFIED IN CODE, local only (not deployed) | `services/company_names.py` (`resolve`, `from_quote`, `search_name`, `builtin_name`), `news_service._rss_query` and `select_articles`. Tests: `tests/test_company_names.py` (11). Section 3c |
+| 13. Company names and news on Render | VERIFIED IN CODE, verified live | `services/company_names.py` (`resolve`, `from_quote`, `search_name`, `builtin_name`), `news_service._rss_query` and `select_articles`. Tests: `tests/test_company_names.py` (11). Section 3c |
 | 12. Structured JSON logging | VERIFIED IN CODE | `core/logging_setup.py`: one JSON object per line with ts, level, logger, msg, request_id, prompt_version and event fields; `LOG_FORMAT=text` for local use |
 
 ---
@@ -309,7 +321,7 @@ Headline counts and pillars were the same in all three modes. Also checked: the 
 10. **Open surface:** `/docs` is public and CORS is `*`.
 11. **Data licensing:** data is from Yahoo via yfinance, which is not licensed for commercial use. Google News sometimes returns 429 and Yahoo news is sometimes down.
 12. **Hosting and regulation:** Vercel Hobby does not allow commercial use, and SEBI research-analyst registration is not resolved.
-13. **Company names on Render:** live v2.1.0 still shows "AAPL Corp." and few headlines, because `ticker.info` is empty from Render's IP. Fixed on branch `fix/company-name-news` (v2.1.1, section 3c) but **not deployed**; until it is live and checked, do not claim it is fixed in production.
+13. **Data from `ticker.info` on Render:** fixed for company names in v2.1.1 (section 3c), but `sector`, `industry` and the earnings date still come back empty on Render, because they also depend on `ticker.info`.
 14. **No evaluation set** for brief quality, **no calibration** of confidence, and **one Uvicorn worker** on one instance.
 
 ---

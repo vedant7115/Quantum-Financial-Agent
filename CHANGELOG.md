@@ -1,6 +1,8 @@
 # Changelog
 
-## Quantum v2.1.1 (on branch `fix/company-name-news`, not deployed yet)
+## Quantum v2.1.1 (2026-11-21)
+
+Deployed and checked live: AAPL, RELIANCE and KO show their real names with 5, 6 and 7 headlines (AAPL had 1 before).
 
 Fixes company names and news on the live site. Scoring formulas, weights and thresholds are unchanged; the response gains one field.
 

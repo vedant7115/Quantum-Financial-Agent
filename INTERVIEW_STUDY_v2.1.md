@@ -159,17 +159,17 @@ No. It's computed from data completeness, how far the pillars agree and signal s
   - All state is in memory with one worker.
   - No evaluation set for briefs, and no calibration of confidence.
   - Unlicensed data.
-  - Company names failed on the hosted server (fixed in v2.1.1, question 31).
+  - Sector, industry and earnings date are still empty on the hosted server (names fixed in v2.1.1, question 31).
   - No payments yet.
 - **Next:**
-  - Deploy and verify the names fix.
+  - Get sector and earnings date from a source that works on Render.
   - Move quotas and usage to Postgres.
   - Connect Razorpay so keys are issued automatically.
   - Build a small evaluation set.
 
 **31. What went wrong in production, and how did you fix it?**
 After deploying, the live report for Apple showed "AAPL Corp." and only one headline, although everything worked on my laptop. The live response gave the cause away: sector, industry and the earnings date were empty, but price history and market cap were fine. Yahoo's `quoteSummary` endpoint, which `ticker.info` uses and which needs a cookie and crumb, returns nothing for cloud IPs, while the chart endpoint still works. The news filter needed a word from the company name, so a fake name filtered out the real headlines. I fixed it with layered fallbacks in `services/company_names.py`: the info dict, then the name in the price-history metadata I was already downloading, then Yahoo's search endpoint, then a built-in map, then the plain ticker, never an invented name. A found name is cached for 24 hours and a failure for only 5 minutes, so one bad moment doesn't stick for a day. News now searches by ticker plus exchange when there's no name, and I added 11 mocked tests, one per layer plus the all-failed case. The lesson: test under production network conditions, and never let a placeholder look like real data.
-(Say "fixed and tested locally under simulated Render conditions" until v2.1.1 is deployed and checked live.)
+(Live after the fix: AAPL went from 1 headline to 5, and every name came from the price-history metadata, which confirmed the cause.)
 
 ---
 
