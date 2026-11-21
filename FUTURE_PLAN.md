@@ -40,6 +40,7 @@ So you can start selling **today** by hand, and Razorpay just automates the same
 - **Fix:** get the name from another Yahoo call that works from Render, and search news by ticker too.
 - **Why first:** every visitor sees it, and it makes reports worse.
 - **Time:** about **1–2 hours**.
+- **Status (2026-11-21):** built and tested on branch `fix/company-name-news` (v2.1.1). Waiting for your "deploy".
 
 ### Step 2 — Razorpay payments (automatic keys)
 - **What:** the "Buy" buttons, Razorpay checkout, payment check, automatic key on screen.

@@ -38,7 +38,7 @@ app = FastAPI(
     lifespan=lifespan,
     title="QUANTUM AGENT API",
     description="Multi-Agent Financial Intelligence Platform — Technical, Fundamental & Sentiment Analysis",
-    version="2.1.0",
+    version="2.1.1",
 )
 
 # ── CORS (Cross-Origin Resource Sharing) ──────────────────────────────────────
@@ -77,7 +77,7 @@ async def root():
     return {
         "name": "QUANTUM AGENT API",
         "status": "online",
-        "version": "2.1.0",
+        "version": "2.1.1",
         "docs": "/docs",
         "endpoints": {
             "analyze": "POST /api/analyze",

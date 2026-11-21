@@ -12,6 +12,9 @@ import logging
 import requests
 from requests.adapters import HTTPAdapter
 
+from services import company_names
+from services.cache_service import cache
+
 class TimeoutHTTPAdapter(HTTPAdapter):
     def __init__(self, *args, **kwargs):
         self.timeout = kwargs.pop("timeout", 5.0)
@@ -248,7 +251,12 @@ def get_stock_data(symbol: str) -> dict:
 
         
         # 2. Use already-fetched ticker info for fundamental data
-        name = info.get("longName") or info.get("shortName") or f"{symbol} Corp."
+        # Layered lookup (quote, chart metadata, search, built-in map, plain ticker); see company_names.py.
+        try:
+            history_metadata = ticker.history_metadata or {}
+        except Exception:
+            history_metadata = {}
+        name, name_source = company_names.resolve(resolved_symbol, info, history_metadata, cache=cache)
         market_cap_raw = info.get("marketCap")
         if not market_cap_raw:
             # ticker.info is often blocked on cloud hosts; fast_info usually still works.
@@ -296,6 +304,7 @@ def get_stock_data(symbol: str) -> dict:
         return {
             "symbol": resolved_symbol,
             "name": name,
+            "name_source": name_source,  # yahoo_quote | yahoo_chart | yahoo_search | builtin | ticker
             "price": round(safe_float(last_price), 2),
             "change": round(safe_float(change), 2),
             "change_pct": round(safe_float(change_pct), 2),

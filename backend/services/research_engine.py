@@ -755,7 +755,7 @@ def assemble(symbol: str, stock_data: dict, close: pd.Series, price: tuple, fund
 
     return {
         "as_of": close.index[-1].strftime("%Y-%m-%d"),
-        "name": stock_data.get("name"), "sector": stock_data.get("sector"), "industry": stock_data.get("industry"),
+        "name": stock_data.get("name"), "name_source": stock_data.get("name_source"), "sector": stock_data.get("sector"), "industry": stock_data.get("industry"),
         "currency": currency, "currency_symbol": sym_cur,
         "market_cap": format_money(stock_data.get("market_cap_raw"), currency) if stock_data.get("market_cap_raw") else None,
         "composite": int(round(composite)), "technical_score": _r(technical_score, 0), "fundamental_score": _r(fundamental_score, 0),
